@@ -12,7 +12,7 @@
   "fetch": [
     {
       "from": "https://github.com/igwtech/neocron-renodx-engine/releases/download/v0.1.0/neocron-renodx-engine.addon32",
-      "extract": "none",
+      "extract": "",
       "files": [
         { "src": "neocron-renodx-engine.addon32", "dst": "neocron-renodx-engine.addon32" }
       ]
