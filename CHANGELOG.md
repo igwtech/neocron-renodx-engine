@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1] — 2026-05-09
+
+Launcher distribution polish — no functional changes.
+
+- `addon.json` now fetches `neocron-renodx-engine.addon32` from the
+  v0.1.0 GitHub release artifact. End users install via the launcher
+  by pasting the repo URL — no mingw-w64 build step required.
+- `bin/` stays in `.gitignore` (binaries live in the GitHub release).
+
 ## [0.1.0] — 2026-05-09
 
 Initial release. Tier 4 (engine shader injection) milestones 1 and 2
