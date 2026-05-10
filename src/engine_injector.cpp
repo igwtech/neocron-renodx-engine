@@ -60,12 +60,21 @@ namespace {
 // correction permutation has its own bytecode CRC. They all sample
 // s0=albedo, s1=lightmap; we substitute every known variant with our
 // single replacement (which adds normal sampling on s5 + lighting math).
-constexpr uint32_t WORLD_PS_CRCS[] = {
-    0x2ccf5eb7u,  // primary — original world.ps
-    0xbea29c90u,  // variant A (likely fog/no-fog or different color matrix)
-    0xcc8904f8u,  // variant B
+// All known game pixel shader CRCs — all share the same 7-instruction
+// `albedo * vcol * lightmap * colorCorrection.x` body (verified via
+// D3DDisassemble). Single unified replacement covers all of them.
+// HUD draws among these are protected because (a) z-test is off so
+// bind_normal_for_draw doesn't bind a normal, (b) per-tex hash misses
+// so BUMP_ON=0 → shader takes the vanilla path → output is byte-equal
+// to the game's original.
+constexpr uint32_t GAME_PS_CRCS[] = {
+    0x2ccf5eb7u,  // world.ps primary
+    0xbea29c90u,  // world.ps variant A
+    0xcc8904f8u,  // world.ps variant B
+    0x96f566cbu,  // mesh.ps (NPCs, items, decals, HUD)
+    0xeb1b9a91u,  // overlay.ps (cursor, damage flash)
 };
-constexpr uint32_t WORLD_PS_CRC          = 0x2ccf5eb7u;  // legacy alias
+constexpr uint32_t WORLD_PS_CRC = 0x2ccf5eb7u;  // legacy alias
 constexpr UINT     NORMAL_SAMPLER        = 5;   // moved off s2 — game/ReShade was clobbering s2
 constexpr const char* DEFAULT_NORMAL_FILE = "neocron_default_normal.png";
 // Two indexes are loaded if present:
@@ -84,11 +93,12 @@ constexpr const char* STOCK_CORPUS_DIR  = "gfx_normals_stock\\";
 constexpr size_t HASH_SAMPLE_BYTES = 4096;  // must match build-hash-index.py
 constexpr size_t NORMAL_CACHE_MAX  = 256;   // cap LRU; ~50 MB for typical 256² normals
 
-// Pixel-shader constant registers — c0..c7 reserved for game's world.ps.
+// Pixel-shader constant registers — c0..c7 reserved for game's shaders.
 constexpr UINT  PARAMS_PS_REG = 20;   // c20 = bump_amp, light_min, light_max, debug_mode
 constexpr UINT  SUN_PS_REG    = 21;   // c21 = sun direction xyz + bump_on flag w
 constexpr UINT  EXTRA_PS_REG  = 22;   // c22 = lm_driven, lm_amp, spec_strength, spec_shininess
 constexpr UINT  EXTRA2_PS_REG = 23;   // c23 = rim_strength, lm_tap_offset, screen_inv_w, screen_inv_h
+constexpr UINT  EXTRA3_PS_REG = 24;   // c24 = normal_y_flip, ...
 
 // Tunables (default values; hotkeys mutate at runtime)
 struct Tunables {
@@ -107,20 +117,39 @@ std::atomic<int>   g_debug_mode{0};
 // New v0.4.6 scene-reactive tunables
 std::atomic<float> g_lm_driven   {1.0f};   // 0=fixed sun, 1=lightmap-gradient sun
 std::atomic<float> g_lm_amp      {4.0f};   // gradient amplification
-std::atomic<float> g_spec_strength{0.4f};
+std::atomic<float> g_spec_strength{0.2f};   // halved vs v0.4.7 (was 0.4)
 std::atomic<float> g_spec_shiny  {16.0f};
-std::atomic<float> g_rim_strength{0.3f};
+std::atomic<float> g_rim_strength{0.0f};    // OFF by default; was 0.3 → vaseline
 std::atomic<float> g_lm_tap      {0.005f}; // UV step for gradient sampling
 
 // Tracked screen size, refreshed each present.
 std::atomic<float> g_screen_inv_w{1.0f / 1920.0f};
 std::atomic<float> g_screen_inv_h{1.0f / 1080.0f};
 
+// v0.4.8 — flip normal Y axis (DeepBump uses OpenGL Y-down convention,
+// game expects Y-up). Default ON since users see inverted bumps.
+std::atomic<float> g_normal_y_flip{1.0f};
+
 // Fallback sun direction (used when LM_DRIVEN < 1.0)
 constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
 
-// m4 v0.4.6 — scene-reactive lighting via lightmap-derived sun + view-
-// dependent specular via VPOS-derived view direction.
+// m4 v0.4.8 — UNIFIED shader replacement (one HLSL handles all 5 known
+// game PS variants — they all turned out to disassemble to byte-identical
+// 7-instruction code: `albedo*vcol*lightmap*colorCorrection.x`).
+//
+// Critical bug fix from v0.4.7: vcol was being read from COLOR0; the
+// game ACTUALLY uses TEXCOORD2 (verified via D3DDisassemble of the
+// dumped 96f566cb.dxbc). That's why HUD elements rendered as solid
+// gray rectangles — we were reading garbage from COLOR0.
+//
+// Other fixes also in this rev:
+//   * Lightmap gradient sign was inverted (now +grad).
+//   * Spec/rim modulated by lightmap so unlit areas don't glow.
+//   * Alpha preservation: vanilla.a = albedo.a * vcol.a.
+//   * Normal Y flip toggle (DeepBump uses Y-down).
+//
+// Constant register c4 = the GAME's colorCorrection (we read its value;
+// the game writes it per draw). c20-c24 = our addon's tunables.
 //
 // Pixel-shader constants (c0..c7 reserved for game's world.ps):
 //   c20.x = BUMP_AMP        (XY normal tilt, 0.5..15)
@@ -140,119 +169,94 @@ constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
 // Both world.ps and mesh.ps compile to ps_3_0 (DXVK supports trivially)
 // so we get VPOS for screen-position-derived view direction.
 //
-// world.ps replacement
-const char* WORLD_PS_HLSL = R"hlsl(
+// UNIFIED replacement — same HLSL handles world.ps + mesh.ps + variants.
+// All four dumped game PS variants (mesh, 2 world-fog, overlay) had
+// IDENTICAL disassembly: 7-instr `albedo*vcol*lightmap*colorCorrection.x`.
+//
+// Vanilla output (BUMP_ON=0):
+//     rgb = albedo.rgb * vcol.rgb * lightmap.rgb * colorCorrection.x
+//     a   = albedo.a   * vcol.a
+//
+// Bump path (BUMP_ON=1) adds normal-mapped diffuse + view-dependent
+// spec / rim ON TOP of the vanilla colour.
+const char* UNIFIED_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);
 sampler2D samplerLightmap : register(s1);
 sampler2D samplerNormal   : register(s5);
+
+float4 colorCorrection : register(c4);  // GAME's per-draw constant
 
 float4 g_params : register(c20);
 float4 g_sun    : register(c21);
 float4 g_extra  : register(c22);
 float4 g_extra2 : register(c23);
+float4 g_extra3 : register(c24);
 
 float luminance(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 
-float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1,
-            float4 vcol : COLOR0, float2 vpos : VPOS) : COLOR {
+float4 main(float2 uv    : TEXCOORD0,
+            float2 uv_lm : TEXCOORD1,
+            float4 vcol  : TEXCOORD2,        // CRITICAL: game uses TEXCOORD2
+            float2 vpos  : VPOS) : COLOR {
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
-    float4 vanilla  = saturate(albedo * lightmap * 2.0);
 
-    if (g_sun.w < 0.5) return vanilla;
+    // EXACT vanilla NC2 formula — matches all 4 disassembled game PS
+    float3 vanilla_rgb = albedo.rgb * vcol.rgb * lightmap.rgb * colorCorrection.x;
+    float  vanilla_a   = albedo.a   * vcol.a;
 
-    // --- Normal in tangent space, with XY amplified ---
+    if (g_sun.w < 0.5) return float4(vanilla_rgb, vanilla_a);
+
+    // --- Normal in tangent space + Y flip toggle (DeepBump=Y-down) ---
     float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
+    n_raw.y *= (g_extra3.x > 0.5) ? -1.0 : 1.0;
     float3 n_ts  = normalize(float3(n_raw.xy * g_params.x, n_raw.z));
 
-    // --- Light direction: blend fixed sun ↔ lightmap gradient ---
-    float lm_d = g_extra.x;     // 0=fixed, 1=full lightmap-driven
+    // --- Light direction: blend fixed sun ↔ lightmap-gradient ---
+    float lm_d = g_extra.x;
     float lm_a = g_extra.y;
     float d    = g_extra2.y;
     float L_c = luminance(lightmap.rgb);
     float L_r = luminance(tex2D(samplerLightmap, uv_lm + float2(d, 0)).rgb);
     float L_u = luminance(tex2D(samplerLightmap, uv_lm + float2(0, d)).rgb);
     float2 grad = float2(L_r - L_c, L_u - L_c) * lm_a;
-    float3 sun_dyn = normalize(float3(-grad, 1.0));   // light comes FROM the brighter direction
+    float3 sun_dyn = normalize(float3(grad, 1.0));
     float3 L = normalize(lerp(g_sun.xyz, sun_dyn, lm_d));
 
-    // --- View direction approx from VPOS (screen pos) ---
-    // Vector from screen center to current pixel, in tangent space approx.
-    float2 ndc = vpos.xy * g_extra2.zw * 2.0 - 1.0;  // -1..1
-    float3 V   = normalize(float3(-ndc.x, ndc.y, 1.5));    // forward + screen offset
-
-    // --- Diffuse Lambertian ---
-    float NdotL = saturate(dot(n_ts, L));
-    float diff  = lerp(g_params.y, g_params.z, NdotL);
-
-    // --- View-dependent half-vector specular ---
-    float3 H     = normalize(L + V);
-    float NdotH  = saturate(dot(n_ts, H));
-    float spec   = pow(NdotH, max(1.0, g_extra.w)) * g_extra.z;
-
-    // --- Fresnel rim (face-on = 0, grazing = strong) ---
-    float NdotV  = saturate(dot(n_ts, V));
-    float rim    = pow(1.0 - NdotV, 3.0) * g_extra2.x;
-
-    // --- Compose ---
-    float3 lit_rgb = vanilla.rgb * diff
-                   + lightmap.rgb * spec * 2.0
-                   + rim;
-
-    // --- Debug viz ---
-    float mode = g_params.w;
-    if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0);
-    if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);
-    if (mode > 2.5)                return albedo;
-    return float4(saturate(lit_rgb), albedo.a);
-}
-)hlsl";
-
-// mesh.ps replacement — same scheme, no lightmap (mesh.ps only has albedo).
-// Lightmap-derived light direction not available; use fixed sun only.
-constexpr uint32_t MESH_PS_CRC = 0x96f566cbu;
-const char* MESH_PS_HLSL = R"hlsl(
-sampler2D samplerAlbedo : register(s0);
-sampler2D samplerNormal : register(s5);
-
-float4 g_params : register(c20);
-float4 g_sun    : register(c21);
-float4 g_extra  : register(c22);
-float4 g_extra2 : register(c23);
-
-float4 main(float2 uv : TEXCOORD0, float4 vcol : COLOR0,
-            float2 vpos : VPOS) : COLOR {
-    float4 albedo  = tex2D(samplerAlbedo, uv);
-    float4 vanilla = albedo * vcol;
-
-    if (g_sun.w < 0.5) return vanilla;
-
-    float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
-    float3 n_ts  = normalize(float3(n_raw.xy * g_params.x, n_raw.z));
-
-    float3 L = normalize(g_sun.xyz);
+    // --- View direction approx from VPOS ---
     float2 ndc = vpos.xy * g_extra2.zw * 2.0 - 1.0;
     float3 V   = normalize(float3(-ndc.x, ndc.y, 1.5));
 
+    // --- Lambertian diffuse ---
     float NdotL = saturate(dot(n_ts, L));
     float diff  = lerp(g_params.y, g_params.z, NdotL);
 
+    // --- Half-vector specular, modulated by lightmap + NdotL ---
     float3 H    = normalize(L + V);
     float NdotH = saturate(dot(n_ts, H));
     float spec  = pow(NdotH, max(1.0, g_extra.w)) * g_extra.z;
+    float3 spec_color = lightmap.rgb * spec * NdotL;
 
+    // --- Fresnel rim, modulated by lightmap ---
     float NdotV = saturate(dot(n_ts, V));
     float rim   = pow(1.0 - NdotV, 3.0) * g_extra2.x;
+    float3 rim_color = lightmap.rgb * rim;
 
-    float3 lit_rgb = vanilla.rgb * diff + spec.xxx * 0.5 + rim.xxx;
+    // --- Compose: vanilla colour modulated by diff + alpha-scaled highlights ---
+    float a = vanilla_a;
+    float3 lit_rgb = vanilla_rgb * diff + (spec_color + rim_color) * a;
 
     float mode = g_params.w;
     if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0);
     if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);
     if (mode > 2.5)                return albedo;
-    return float4(saturate(lit_rgb), albedo.a);
+    return float4(saturate(lit_rgb), a);
 }
 )hlsl";
+
+// CRC list of game pixel shaders we substitute. They all happen to share
+// the same 7-instruction body, so one replacement covers them all.
+constexpr uint32_t MESH_PS_CRC = 0x96f566cbu;   // legacy alias, still used in dump filter
 
 // ── CRC32 ────────────────────────────────────────────────────────────
 uint32_t crc32(const uint8_t* data, size_t len) {
@@ -272,8 +276,7 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(
 
 HMODULE        g_d3dc        = nullptr;
 PFN_D3DCompile g_D3DCompile  = nullptr;
-std::vector<uint8_t> g_world_ps_bytecode;
-std::vector<uint8_t> g_mesh_ps_bytecode;
+std::vector<uint8_t> g_unified_bytecode;
 std::atomic<uint64_t> g_replacements_done{0};
 
 bool compile_one(const char* hlsl, const char* tag, std::vector<uint8_t>& out) {
@@ -314,9 +317,7 @@ bool compile_replacement() {
     }
     g_D3DCompile = (PFN_D3DCompile)GetProcAddress(g_d3dc, "D3DCompile");
     if (!g_D3DCompile) return false;
-    bool ok_w = compile_one(WORLD_PS_HLSL, "world.ps", g_world_ps_bytecode);
-    bool ok_m = compile_one(MESH_PS_HLSL,  "mesh.ps",  g_mesh_ps_bytecode);
-    return ok_w && ok_m;
+    return compile_one(UNIFIED_PS_HLSL, "unified", g_unified_bytecode);
 }
 
 // ── default normal map (loaded once at first present) ────────────────
@@ -591,7 +592,7 @@ bool on_create_pipeline(reshade::api::device*,
                         reshade::api::pipeline_layout,
                         uint32_t subobject_count,
                         const reshade::api::pipeline_subobject* subobjects) {
-    if (g_world_ps_bytecode.empty() && g_mesh_ps_bytecode.empty()) return false;
+    if (g_unified_bytecode.empty()) return false;
     bool modified = false;
     for (uint32_t i = 0; i < subobject_count; ++i) {
         const auto& s = subobjects[i];
@@ -600,27 +601,18 @@ bool on_create_pipeline(reshade::api::device*,
         if (!desc || !desc->code || !desc->code_size) continue;
         uint32_t c = crc32(static_cast<const uint8_t*>(desc->code), desc->code_size);
 
-        const std::vector<uint8_t>* repl = nullptr;
-        const char* tag = nullptr;
-        bool is_world_variant = false;
-        for (uint32_t known : WORLD_PS_CRCS) {
-            if (c == known) { is_world_variant = true; break; }
-        }
-        if (is_world_variant && !g_world_ps_bytecode.empty()) {
-            repl = &g_world_ps_bytecode; tag = "world.ps";
-        } else if (c == MESH_PS_CRC && !g_mesh_ps_bytecode.empty()) {
-            repl = &g_mesh_ps_bytecode;  tag = "mesh.ps";
-        }
-        if (!repl) continue;
+        bool is_game_ps = false;
+        for (uint32_t known : GAME_PS_CRCS) if (c == known) { is_game_ps = true; break; }
+        if (!is_game_ps) continue;
 
-        desc->code      = repl->data();
-        desc->code_size = repl->size();
+        desc->code      = g_unified_bytecode.data();
+        desc->code_size = g_unified_bytecode.size();
         modified = true;
         uint64_t n = g_replacements_done.fetch_add(1, std::memory_order_relaxed) + 1;
         char buf[160];
         std::snprintf(buf, sizeof(buf),
-            "renodx-engine: %s create_pipeline #%llu — substituted (%zu bytes)",
-            tag, (unsigned long long)n, repl->size());
+            "renodx-engine: game PS %08x create_pipeline #%llu — substituted (%zu bytes)",
+            (unsigned)c, (unsigned long long)n, g_unified_bytecode.size());
         reshade::log::message(reshade::log::level::info, buf);
     }
     return modified;
@@ -646,18 +638,13 @@ void on_init_pipeline(reshade::api::device*,
         uint32_t c = crc32(static_cast<const uint8_t*>(desc->code), desc->code_size);
         std::lock_guard<std::mutex> g(g_pipe_mu);
         g_ps_pipeline_to_crc[pipeline.handle] = c;
-        // Mark substituted pipelines so bind_pipeline can flag them for
-        // bind_normal_for_draw. We compare to either replacement bytecode.
-        if ((!g_world_ps_bytecode.empty() &&
-             desc->code == g_world_ps_bytecode.data() &&
-             desc->code_size == g_world_ps_bytecode.size()) ||
-            (!g_mesh_ps_bytecode.empty() &&
-             desc->code == g_mesh_ps_bytecode.data() &&
-             desc->code_size == g_mesh_ps_bytecode.size())) {
+        if (!g_unified_bytecode.empty() &&
+            desc->code == g_unified_bytecode.data() &&
+            desc->code_size == g_unified_bytecode.size()) {
             g_substituted_ps_pipelines.insert(pipeline.handle);
         }
-        bool is_known = (c == MESH_PS_CRC);
-        for (uint32_t known : WORLD_PS_CRCS) if (c == known) is_known = true;
+        bool is_known = false;
+        for (uint32_t known : GAME_PS_CRCS) if (c == known) is_known = true;
         if (g_dumped_ps.insert(c).second && !is_known)
             dump_ps_bytecode(c, desc->code, desc->code_size);
     }
@@ -779,47 +766,45 @@ std::atomic<uint64_t> g_world_draws{0};
 std::atomic<uint64_t> g_world_draws_per_tex_hit{0};
 
 inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
-    if (!t_using_substituted_world_ps || !t_z_enabled) return;
+    if (!t_using_substituted_world_ps) return;   // not our shader, don't touch
     auto* dev = reinterpret_cast<IDirect3DDevice9*>(cmd->get_device()->get_native());
     if (!dev) return;
 
-    // Resolve which normal to bind from whatever the game just put on s0.
+    // Per-tex lookup only for 3D world geometry (z-test on). HUD draws
+    // (z-test off) skip the lookup AND the normal binding, but we STILL
+    // push BUMP_ON=0 constants so the shader takes the vanilla path.
     IDirect3DTexture9* normal = nullptr;
-    IDirect3DBaseTexture9* albedo = nullptr;
-    dev->GetTexture(0, &albedo);
-    if (albedo) {
-        uint64_t handle = (uint64_t)albedo;
-        uint64_t hash   = 0;
-        bool need_hash  = false;
-        {
-            std::lock_guard<std::mutex> g(g_resource_mu);
-            auto it = g_resource_to_hash.find(handle);
-            if (it != g_resource_to_hash.end()) hash = it->second;
-            else need_hash = true;
-        }
-        if (need_hash) {
-            // First time we've seen this albedo bound — hash it now.
-            // hash_d3d9_texture returns 0 if LockRect fails (e.g.
-            // POOL_DEFAULT without a system copy), which we cache as
-            // "miss" to avoid re-trying every draw.
-            hash = hash_d3d9_texture(albedo);
+    if (t_z_enabled) {
+        IDirect3DBaseTexture9* albedo = nullptr;
+        dev->GetTexture(0, &albedo);
+        if (albedo) {
+            uint64_t handle = (uint64_t)albedo;
+            uint64_t hash   = 0;
+            bool need_hash  = false;
             {
                 std::lock_guard<std::mutex> g(g_resource_mu);
-                g_resource_to_hash[handle] = hash;
+                auto it = g_resource_to_hash.find(handle);
+                if (it != g_resource_to_hash.end()) hash = it->second;
+                else need_hash = true;
             }
-            if (hash) {
-                if (lookup_normal_path(hash))
-                    g_index_hits.fetch_add(1, std::memory_order_relaxed);
-                else
-                    g_index_misses.fetch_add(1, std::memory_order_relaxed);
+            if (need_hash) {
+                hash = hash_d3d9_texture(albedo);
+                {
+                    std::lock_guard<std::mutex> g(g_resource_mu);
+                    g_resource_to_hash[handle] = hash;
+                }
+                if (hash) {
+                    if (lookup_normal_path(hash))
+                        g_index_hits.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        g_index_misses.fetch_add(1, std::memory_order_relaxed);
+                }
             }
+            if (hash) normal = get_or_load_normal(dev, hash);
+            albedo->Release();
         }
-        if (hash) normal = get_or_load_normal(dev, hash);
-        albedo->Release();
     }
 
-    // Per-tex hit means real bump path. Otherwise the shader sees BUMP_ON=0
-    // and bypasses sampler 5 entirely, returning vanilla albedo*lightmap*2.
     bool per_tex = normal != nullptr;
     if (per_tex) {
         dev->SetTexture(NORMAL_SAMPLER, normal);
@@ -829,7 +814,9 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     }
 
-    // Push tunables to pixel-shader constants. ~16 floats per draw, cheap.
+    // ALWAYS push constants — even for HUD draws, so BUMP_ON=0 is
+    // explicit and the shader doesn't read stale BUMP_ON=1 from a
+    // previous world.ps draw (which was the v0.4.7 UI-corruption bug).
     float params[4] = {
         g_bump_amp.load(std::memory_order_relaxed),
         g_light_min.load(std::memory_order_relaxed),
@@ -845,10 +832,12 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         g_rim_strength.load(), g_lm_tap.load(),
         g_screen_inv_w.load(), g_screen_inv_h.load()
     };
+    float extra3[4] = { g_normal_y_flip.load(), 0.0f, 0.0f, 0.0f };
     dev->SetPixelShaderConstantF(PARAMS_PS_REG, params, 1);
     dev->SetPixelShaderConstantF(SUN_PS_REG,    sun,    1);
     dev->SetPixelShaderConstantF(EXTRA_PS_REG,  extra,  1);
     dev->SetPixelShaderConstantF(EXTRA2_PS_REG, extra2, 1);
+    dev->SetPixelShaderConstantF(EXTRA3_PS_REG, extra3, 1);
 
     g_world_draws.fetch_add(1, std::memory_order_relaxed);
     if (per_tex) {
@@ -856,8 +845,8 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         if (n == 1) {
             char buf[160];
             std::snprintf(buf, sizeof(buf),
-                "renodx-engine: FIRST per-texture normal bound (resource=%p tex=%p)",
-                (void*)albedo, (void*)normal);
+                "renodx-engine: FIRST per-texture normal bound (tex=%p)",
+                (void*)normal);
             reshade::log::message(reshade::log::level::info, buf);
         }
     }
@@ -924,6 +913,12 @@ void on_overlay(reshade::api::effect_runtime*) {
     if (ImGui::SliderFloat("Specular shininess", &sh, 1.0f, 128.0f,"%.0f")) g_spec_shiny.store(sh);
     if (ImGui::SliderFloat("Rim strength",       &rs, 0.0f, 2.0f,  "%.2f")) g_rim_strength.store(rs);
 
+    ImGui::Separator();
+    ImGui::TextUnformatted("Normal map convention");
+    bool y_flip = g_normal_y_flip.load() > 0.5f;
+    if (ImGui::Checkbox("Flip normal Y (DeepBump=ON, Y-up=OFF)", &y_flip))
+        g_normal_y_flip.store(y_flip ? 1.0f : 0.0f);
+
     if (ImGui::Button("Reset to defaults")) {
         g_bump_amp.store(5.0f);
         g_light_min.store(0.20f);
@@ -932,9 +927,10 @@ void on_overlay(reshade::api::effect_runtime*) {
         g_lm_driven.store(1.0f);
         g_lm_amp.store(4.0f);
         g_lm_tap.store(0.005f);
-        g_spec_strength.store(0.4f);
+        g_spec_strength.store(0.2f);   // halved — vaseline fix default
         g_spec_shiny.store(16.0f);
-        g_rim_strength.store(0.3f);
+        g_rim_strength.store(0.0f);    // off by default — was the vaseline source
+        g_normal_y_flip.store(1.0f);
         log_tunables("ImGui reset");
     }
 
@@ -1013,7 +1009,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.4.7 (world.ps × 3 variants + mesh.ps; ps_3_0; scene-reactive) registered");
+                "renodx-engine: m4 v0.4.8 (UNIFIED replacement; vanilla-byte-correct; UI-safe) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "

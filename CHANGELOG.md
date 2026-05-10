@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.4.8] — 2026-05-10
+
+Reverse-engineered the game's exact pixel-shader formula via
+D3DDisassemble (a tiny Wine-runnable tool was built for the purpose).
+All 4 dumped game pixel shaders (`0x96f566cb`, `0xbea29c90`,
+`0xcc8904f8`, `0xeb1b9a91`) turned out to disassemble to byte-identical
+7-instruction code:
+
+```
+output.rgb = albedo.rgb * vcol.rgb * lightmap.rgb * colorCorrection.x
+output.a   = albedo.a   * vcol.a
+```
+
+So NC2's renderer effectively has ONE pixel shader for everything, and
+v0.4.8 ships ONE unified replacement that mirrors this vanilla formula
+exactly when `BUMP_ON=0`. UI / overlays / signs are now byte-identical
+to the game's original output (they were corrupted in v0.4.7).
+
+### Critical bugs fixed
+- **vcol was being read from `COLOR0`; the game ACTUALLY uses
+  `TEXCOORD2`.** That single mismatch explains the gray-rectangle UI
+  in v0.4.7 — we were reading garbage interpolant data.
+- `colorCorrection` (game's c4) is now read by our shader; missing it
+  was washing out colors.
+- `lightmap` is sampled in mesh.ps too (HUD elements bind a 1×1 white,
+  but the game's shader still reads from s1).
+- **`bind_normal_for_draw` now ALWAYS pushes constants** when our
+  shader is bound, including HUD draws (z-test off). Without this,
+  the shader read stale `BUMP_ON=1` from a previous world.ps draw and
+  tried to bump-map the HUD with whatever was last in sampler 5.
+- Lightmap gradient sign inverted (`+grad`, not `-grad`).
+- Spec/rim modulated by lightmap so unlit areas don't glow.
+- Default rim strength = 0 (was 0.3 → caused vaseline look).
+- Default spec strength halved.
+- Normal Y flip toggle (DeepBump uses Y-down) — checkbox in overlay,
+  default ON.
+- Alpha preservation: returns `vanilla.a = albedo.a * vcol.a`.
+
+### Coverage
+Substitution list expanded to all 5 known game PS CRCs (3 world
+variants + mesh + overlay). All five route through the same unified
+replacement. HUD safety: per-tex hashing skipped when z-test off, and
+HUD textures don't match the index anyway, so BUMP_ON=0 → vanilla
+output.
+
+### Tooling
+`tools/disasm.cpp` (new) — i686-w64-mingw32 + d3dcompiler_47.dll +
+Wine, disassembles any `.dxbc` to ASM. Used to reverse all game PSes.
+
 ## [0.4.7] — 2026-05-10
 
 Cover the two extra world.ps **variants** (`0xbea29c90` and
