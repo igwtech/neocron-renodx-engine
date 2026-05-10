@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.5.2] — 2026-05-10
+
+Compile back down to **ps_2_0**. v0.5.1's per-channel debug viz proved
+that under ps_3_0 our shader could only read sampler 0 (albedo) — game's
+lightmap (s1), vcol (TEXCOORD2/COLOR0), and colorCorrection (c4) all
+came in as zero, so vanilla = albedo × 0 × 0 × 0 = black.
+
+The original game uses ps_2_0 + matching vertex declarations + render
+state. Substituting ps_3_0 bytecode broke the VS-PS interpolant
+linking and constant-table inheritance — the game state didn't reach
+our shader.
+
+Going back to ps_2_0 restores game-state passthrough.
+
+### Cost
+- VPOS semantic unavailable in ps_2_0 → view-dependent specular falls
+  back to a fixed tangent-space `(0, 0, 1)` view direction. Highlights
+  no longer slide with camera motion. We can re-implement camera-
+  reactive specular later via `ddx`/`ddy` of UV instead of VPOS.
+
+### Kept
+- All v0.5.1 debug viz modes + override sliders (still useful when
+  game's c4 is genuinely zero on a draw, e.g. menu).
+- Conservative defaults from v0.5.1.
+
 ## [0.5.1] — 2026-05-10
 
 Diagnostics-first release. v0.4.9 left scenes mostly black, and we

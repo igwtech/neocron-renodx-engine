@@ -205,8 +205,8 @@ float luminance(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 float4 main(float2 uv     : TEXCOORD0,
             float2 uv_lm  : TEXCOORD1,
             float4 vcol_t : TEXCOORD2,       // skinned mesh / HUD uses this
-            float4 vcol_c : COLOR0,          // world.vs uses this (oD0)
-            float2 vpos   : VPOS) : COLOR {
+            float4 vcol_c : COLOR0) : COLOR { // world.vs uses this (oD0)
+    // ps_2_0: no VPOS available, use fixed forward view in tangent space
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
 
@@ -269,9 +269,8 @@ float4 main(float2 uv     : TEXCOORD0,
     float3 sun_dyn = normalize(float3(grad, 1.0));
     float3 L = normalize(lerp(g_sun.xyz, sun_dyn, lm_d));
 
-    // --- View direction approx from VPOS ---
-    float2 ndc = vpos.xy * g_extra2.zw * 2.0 - 1.0;
-    float3 V   = normalize(float3(-ndc.x, ndc.y, 1.5));
+    // ps_2_0: fixed face-on view direction in tangent space (no VPOS)
+    float3 V = float3(0.0, 0.0, 1.0);
 
     // --- Lambertian diffuse ---
     float NdotL = saturate(dot(n_ts, L));
@@ -328,10 +327,13 @@ std::atomic<uint64_t> g_replacements_done{0};
 bool compile_one(const char* hlsl, const char* tag, std::vector<uint8_t>& out) {
     ID3DBlob* code = nullptr;
     ID3DBlob* errs = nullptr;
-    // ps_3_0 needed for VPOS semantic (screen-position-derived view direction).
-    // DXVK supports it trivially on Polaris; original game used ps_2_0.
+    // v0.5.2: BACK TO ps_2_0. ps_3_0 broke game-state passthrough
+    // (lightmap, vcol, colorCorrection all read as 0). Game's VS + render
+    // state assumes ps_2_0 interpolant routing + constant tables.
+    // Cost: VPOS unavailable — view-dependent specular falls back to a
+    // fixed tangent-space (0,0,1) view direction.
     HRESULT hr = g_D3DCompile(hlsl, std::strlen(hlsl), tag,
-        nullptr, nullptr, "main", "ps_3_0", 0, 0, &code, &errs);
+        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &errs);
     if (FAILED(hr) || !code) {
         char buf[400];
         std::snprintf(buf, sizeof(buf),
@@ -1082,7 +1084,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.5.1 (per-channel debug viz + vanilla overrides) registered");
+                "renodx-engine: m4 v0.5.2 (ps_2_0 — restores game lightmap/vcol/cc readability) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
