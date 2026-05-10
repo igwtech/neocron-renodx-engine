@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.4.1] — 2026-05-10
+
+Adds an engine-bundled **stock fallback index + normals** so per-texture
+normals work even when nc2-hd-textures isn't installed. v0.4.1 ships
+68 vanilla brick normals only — concrete / metal / glass etc. still fall
+back to the brick default until subsequent vanilla batches are processed.
+
+### What changed
+- `assets/stock_brick_index.txt` (~2.5 KB, 67 hashes) — committed in
+  repo, deployed to game root as `neocron_stock_index.txt`.
+- `stock_brick_normals.tar.gz` (~61 MB, GitHub release artifact) —
+  fetched + extracted to `gfx_normals_stock/` by the launcher.
+- `engine_injector.cpp` now loads BOTH indexes (HD if present, then
+  stock for non-overlapping hashes) into one map. Each entry's path
+  has its corpus root pre-prepended at load time, so the draw-time
+  lookup is corpus-agnostic.
+- HD index entries take precedence on hash collision.
+
+### Diagnostic line at addon load
+```
+renodx-engine: indexes loaded — HD <N> entries (root='gfx_normals\'),
+stock <M> loaded / <K> kept (root='gfx_normals_stock\'); total map size = <N+K>
+```
+
+### Roadmap
+- Future v0.4.x: expand stock corpus to concrete, metal, glass, doors,
+  floor — same vanilla-extract + DeepBump pipeline.
+- Engine binary stays unchanged across stock expansions; only the
+  `assets/stock_*_index.txt` files and the release tarball grow.
+
 ## [0.4.0] — 2026-05-10
 
 Tier 4 milestone 4 — **per-texture normal lookup**. Each world surface

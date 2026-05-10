@@ -54,14 +54,19 @@ namespace {
 constexpr uint32_t WORLD_PS_CRC          = 0x2ccf5eb7u;
 constexpr UINT     NORMAL_SAMPLER        = 5;   // moved off s2 — game/ReShade was clobbering s2
 constexpr const char* DEFAULT_NORMAL_FILE = "neocron_default_normal.png";
-constexpr const char* TEXTURE_INDEX_FILE  = "neocron_texture_index.txt";
+// Two indexes are loaded if present:
+//   1. HD index (deployed by nc2-hd-textures addon, ~2900 entries hashed
+//      against HD upscaled albedos, normals at gfx_normals/<rel>).
+//   2. Stock index (shipped with this engine addon, hashed against
+//      VANILLA game textures, normals at gfx_normals_stock/<rel>).
+// HD entries take precedence on hash collision; stock fills in surfaces
+// the user hasn't HD-installed yet (currently only bricks — see v0.4.1
+// CHANGELOG).
+constexpr const char* HD_INDEX_FILE     = "neocron_texture_index.txt";
+constexpr const char* STOCK_INDEX_FILE  = "neocron_stock_index.txt";
+constexpr const char* HD_CORPUS_DIR     = "gfx_normals\\";
+constexpr const char* STOCK_CORPUS_DIR  = "gfx_normals_stock\\";
 
-// Where to look for per-texture normals (NORMAL_CORPUS_DIR + relative path
-// from index). Default is `gfx_normals\` relative to the game install dir
-// (CWD when the addon runs) — that's where the nc2-hd-textures addon
-// deploys its AI-generated normal corpus. Override via env var
-// `NEOCRON_NORMALS_DIR` for other layouts (dev machine paths etc).
-constexpr const char* NORMAL_CORPUS_DIR_DEFAULT = "gfx_normals\\";
 constexpr size_t HASH_SAMPLE_BYTES = 4096;  // must match build-hash-index.py
 constexpr size_t NORMAL_CACHE_MAX  = 256;   // cap LRU; ~50 MB for typical 256² normals
 
@@ -224,8 +229,9 @@ bool load_default_normal(IDirect3DDevice9* dev) {
 //   live:   uint64_t resource  → uint64_t hash  (built at init_resource)
 //   cache:  uint64_t hash      → IDirect3DTexture9*  (lazy on first draw use)
 
-std::string g_normal_corpus_dir;     // resolved at addon load
 std::mutex  g_index_mu;
+// Map value is the FULL relative path (corpus_root prepended at load time),
+// so get_or_load_normal doesn't need to know which index it came from.
 std::unordered_map<uint64_t, std::string> g_hash_to_path;
 
 std::mutex  g_resource_mu;
@@ -244,44 +250,68 @@ inline uint64_t hash_pixels(const void* data, size_t avail, uint32_t w, uint32_t
     return ((uint64_t)crc << 32) | ((uint64_t)(w & 0xFFFFu) << 16) | (uint64_t)(h & 0xFFFFu);
 }
 
-bool load_texture_index() {
-    const char* env = std::getenv("NEOCRON_NORMALS_DIR");
-    g_normal_corpus_dir = env && *env ? env : NORMAL_CORPUS_DIR_DEFAULT;
-    if (!g_normal_corpus_dir.empty() &&
-        g_normal_corpus_dir.back() != '\\' && g_normal_corpus_dir.back() != '/')
-        g_normal_corpus_dir.push_back('\\');
+// Load one index file and prepend the given corpus root to each entry's
+// path. Returns (loaded, kept) — `kept` is the number of entries we
+// actually inserted (collisions with already-loaded entries are skipped,
+// preserving precedence from earlier calls).
+std::pair<size_t, size_t> load_one_index(const char* path, const char* corpus_root) {
+    FILE* f = std::fopen(path, "r");
+    if (!f) return { 0, 0 };
 
-    FILE* f = std::fopen(TEXTURE_INDEX_FILE, "r");
-    if (!f) {
-        char buf[300];
-        std::snprintf(buf, sizeof(buf),
-            "renodx-engine: index '%s' not found — per-texture lookup disabled, "
-            "falling back to default brick normal for all surfaces", TEXTURE_INDEX_FILE);
-        reshade::log::message(reshade::log::level::warning, buf);
-        return false;
-    }
-
-    std::lock_guard<std::mutex> g(g_index_mu);
-    g_hash_to_path.clear();
+    size_t loaded = 0, kept = 0;
     char line[1100];
-    size_t n = 0, n_skip = 0;
     while (std::fgets(line, sizeof(line), f)) {
         char hex[24] = {0};
-        char path[1024] = {0};
-        if (std::sscanf(line, "%23s %1023[^\r\n]", hex, path) != 2) { ++n_skip; continue; }
+        char rel[1024] = {0};
+        if (std::sscanf(line, "%23s %1023[^\r\n]", hex, rel) != 2) continue;
         char* endp = nullptr;
         uint64_t h = std::strtoull(hex, &endp, 16);
-        if (!h || endp == hex) { ++n_skip; continue; }
-        g_hash_to_path.emplace(h, path);
-        ++n;
+        if (!h || endp == hex) continue;
+        ++loaded;
+        // Insert only if hash isn't already present (preserves precedence).
+        std::string full = std::string(corpus_root) + rel;
+        // Normalize separators to backslash for Win32 / Wine.
+        for (auto& c : full) if (c == '/') c = '\\';
+        if (g_hash_to_path.emplace(h, std::move(full)).second) ++kept;
     }
     std::fclose(f);
+    return { loaded, kept };
+}
 
-    char buf[200];
+bool load_texture_index() {
+    std::lock_guard<std::mutex> g(g_index_mu);
+    g_hash_to_path.clear();
+
+    // Override (dev machines etc): one env var, applied to whichever index
+    // is loaded. If set, replaces both corpus roots; user is on their own
+    // for stock vs HD layout.
+    const char* env_override = std::getenv("NEOCRON_NORMALS_DIR");
+    std::string hd_root    = env_override && *env_override ? env_override : HD_CORPUS_DIR;
+    std::string stock_root = env_override && *env_override ? env_override : STOCK_CORPUS_DIR;
+    auto ensure_sep = [](std::string& s) {
+        if (!s.empty() && s.back() != '\\' && s.back() != '/') s.push_back('\\');
+    };
+    ensure_sep(hd_root);
+    ensure_sep(stock_root);
+
+    auto [hd_loaded, hd_kept]       = load_one_index(HD_INDEX_FILE,    hd_root.c_str());
+    auto [stock_loaded, stock_kept] = load_one_index(STOCK_INDEX_FILE, stock_root.c_str());
+
+    char buf[400];
     std::snprintf(buf, sizeof(buf),
-        "renodx-engine: index loaded — %zu entries (skipped %zu) from '%s'; corpus dir = '%s'",
-        n, n_skip, TEXTURE_INDEX_FILE, g_normal_corpus_dir.c_str());
+        "renodx-engine: indexes loaded — HD %zu entries (root='%s'), "
+        "stock %zu loaded / %zu kept (root='%s'); total map size = %zu",
+        hd_kept, hd_root.c_str(),
+        stock_loaded, stock_kept, stock_root.c_str(),
+        g_hash_to_path.size());
     reshade::log::message(reshade::log::level::info, buf);
+
+    if (g_hash_to_path.empty()) {
+        reshade::log::message(reshade::log::level::warning,
+            "renodx-engine: NO indexes found — per-texture lookup disabled, "
+            "all surfaces will fall back to brick default normal");
+        return false;
+    }
     return true;
 }
 
@@ -307,10 +337,9 @@ IDirect3DTexture9* get_or_load_normal(IDirect3DDevice9* dev, uint64_t hash) {
         return nullptr;
     }
 
-    std::string full = g_normal_corpus_dir + *rel;
-    // Convert forward slashes (from index built on Linux) to Windows-style
-    // for stbi_load — Wine accepts either, but be safe.
-    for (auto& c : full) if (c == '/') c = '\\';
+    // Index entries are full paths (corpus root prepended at load time +
+    // separators normalized). Use as-is.
+    const std::string& full = *rel;
 
     int w = 0, h = 0, ch = 0;
     unsigned char* px = stbi_load(full.c_str(), &w, &h, &ch, 4);
