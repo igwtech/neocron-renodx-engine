@@ -1,24 +1,30 @@
-// neocron-renodx-engine — Tier 4 m3 PoC (v0.3.0):
-// real per-pixel normal-mapped lighting.
+// neocron-renodx-engine — Tier 4 m4 (v0.4.0):
+// per-texture normal-mapped lighting.
 //
-// Loads ONE normal map (a brick from the AI corpus) at addon startup,
-// binds it to D3D9 sampler 2 every frame, and the replacement world.ps
-// HLSL samples it for Phong-style lighting against a hardcoded sun.
+// Each game world texture (sampler 0 albedo) is fingerprinted via the
+// SAME hash scheme the offline pipeline uses (CRC32 of first 4 KB of
+// raw pixel data + width + height = 64-bit). The hash is looked up in
+// a flat text index shipped with the addon (~115 KB, ~2900 entries).
+// On hit, the matching `_n.png` from the AI normal corpus is lazily
+// loaded as a D3D9 texture and bound at sampler 5 instead of the
+// universal brick fallback.
 //
-// Limitation acknowledged: a single normal map for ALL world surfaces
-// means every wall/floor gets the same brick pattern, which is wrong
-// where the underlying albedo isn't actual brick. This is a pipeline-
-// validation PoC — the next milestone (m4) is per-texture lookup so the
-// correct sibling _n.png binds for each albedo. Doable with a
-// hash-based texture identification scheme; deferred for now because
-// it's substantially more wiring.
+// Hashing is done at `init_resource` time (initial_data is the raw
+// upload buffer — same bytes the offline script reads from the DDS
+// after stripping its 128-byte header). No D3D9 LockRect round-trip
+// needed for hashing.
 //
-// What you should see in-game vs vanilla:
-//   - Brick walls in Plaza outer sectors get visible directional bump
-//     (highlights/shadows on grout lines) — correct effect.
-//   - Smooth concrete walls also get the brick bump — wrong effect, but
-//     proves the per-pixel lighting math is wired.
-//   - Tiled floors get the brick bump too — wrong but visible.
+// Corpus location: hardcoded for the dev machine right now (see
+// NORMAL_CORPUS_DIR below). Future work: launcher-managed addon
+// payload or env-var override.
+//
+// What you should see in-game vs v0.3:
+//   - Brick walls still get the brick normal (correct).
+//   - Carpet, concrete, panelled walls now get THEIR own normals.
+//   - Surfaces whose albedo isn't in the index fall back to the brick
+//     normal (visible but wrong).
+//   - Toggle ReShade Effects OFF (default Home key + button) to see
+//     the raw m4 output — Toddyhancer mangles blue-violet normal data.
 
 #include <windows.h>
 #include <d3d9.h>
@@ -34,7 +40,9 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -43,29 +51,37 @@
 namespace {
 
 // ── tunables ─────────────────────────────────────────────────────────
-constexpr uint32_t WORLD_PS_CRC      = 0x2ccf5eb7u;
-constexpr UINT     NORMAL_SAMPLER    = 5;   // moved off s2 — game/ReShade was clobbering s2
-constexpr DWORD    NORMAL_TILING     = 4;   // multiply UV by this so the brick repeats N times across each surface
+constexpr uint32_t WORLD_PS_CRC          = 0x2ccf5eb7u;
+constexpr UINT     NORMAL_SAMPLER        = 5;   // moved off s2 — game/ReShade was clobbering s2
 constexpr const char* DEFAULT_NORMAL_FILE = "neocron_default_normal.png";
+constexpr const char* TEXTURE_INDEX_FILE  = "neocron_texture_index.txt";
 
-// m3 v0.3.1 — full Phong with brick normal at sampler 5. Confirmed via debug
-// dump that sampler 5 receives the bound texture correctly. Apparent "no
-// effect" of v0.3 was actually Toddyhancer tonemap mangling the output —
-// to see the bump cleanly, toggle ReShade Effects OFF (default key).
+// Where to look for per-texture normals (NORMAL_CORPUS_DIR + relative path
+// from index). Default is `gfx_normals\` relative to the game install dir
+// (CWD when the addon runs) — that's where the nc2-hd-textures addon
+// deploys its AI-generated normal corpus. Override via env var
+// `NEOCRON_NORMALS_DIR` for other layouts (dev machine paths etc).
+constexpr const char* NORMAL_CORPUS_DIR_DEFAULT = "gfx_normals\\";
+constexpr size_t HASH_SAMPLE_BYTES = 4096;  // must match build-hash-index.py
+constexpr size_t NORMAL_CACHE_MAX  = 256;   // cap LRU; ~50 MB for typical 256² normals
+
+// m4 v0.4 — per-texture normals at sampler 5. UV is used 1:1 (no tiling)
+// because each bound normal matches its albedo's UV layout. Fallback brick
+// when no per-texture match: still 1:1, will look low-res on large surfaces
+// but correct topologically.
 const char* WORLD_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);
 sampler2D samplerLightmap : register(s1);
 sampler2D samplerNormal   : register(s5);
 
 static const float3 SUN_TS = float3(0.408, 0.408, 0.816);   // pre-normalised
-static const float  TILING = 4.0;
 
 float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1, float4 vcol : COLOR0) : COLOR {
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
 
-    // Sample tiled normal, decode RGB[0,1] → tangent normal[-1,1], normalise
-    float3 n_ts = tex2D(samplerNormal, uv * TILING).rgb * 2.0 - 1.0;
+    // Sample per-texture normal, decode RGB[0,1] → tangent normal[-1,1]
+    float3 n_ts = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
     n_ts = normalize(n_ts);
 
     // Lambertian against fixed sun
@@ -201,6 +217,173 @@ bool load_default_normal(IDirect3DDevice9* dev) {
     return true;
 }
 
+// ── m4 per-texture normal lookup ─────────────────────────────────────
+//
+// Two layers of mapping:
+//   index:  uint64_t hash      → relative path  (loaded once from .txt)
+//   live:   uint64_t resource  → uint64_t hash  (built at init_resource)
+//   cache:  uint64_t hash      → IDirect3DTexture9*  (lazy on first draw use)
+
+std::string g_normal_corpus_dir;     // resolved at addon load
+std::mutex  g_index_mu;
+std::unordered_map<uint64_t, std::string> g_hash_to_path;
+
+std::mutex  g_resource_mu;
+std::unordered_map<uint64_t, uint64_t>    g_resource_to_hash;
+
+std::mutex  g_normal_cache_mu;
+std::unordered_map<uint64_t, IDirect3DTexture9*> g_normal_cache;
+std::atomic<uint64_t> g_lazy_loaded{0};
+std::atomic<uint64_t> g_index_hits{0};
+std::atomic<uint64_t> g_index_misses{0};
+
+inline uint64_t hash_pixels(const void* data, size_t avail, uint32_t w, uint32_t h) {
+    if (!data || avail == 0) return 0;
+    size_t take = avail < HASH_SAMPLE_BYTES ? avail : HASH_SAMPLE_BYTES;
+    uint32_t crc = crc32(static_cast<const uint8_t*>(data), take);
+    return ((uint64_t)crc << 32) | ((uint64_t)(w & 0xFFFFu) << 16) | (uint64_t)(h & 0xFFFFu);
+}
+
+bool load_texture_index() {
+    const char* env = std::getenv("NEOCRON_NORMALS_DIR");
+    g_normal_corpus_dir = env && *env ? env : NORMAL_CORPUS_DIR_DEFAULT;
+    if (!g_normal_corpus_dir.empty() &&
+        g_normal_corpus_dir.back() != '\\' && g_normal_corpus_dir.back() != '/')
+        g_normal_corpus_dir.push_back('\\');
+
+    FILE* f = std::fopen(TEXTURE_INDEX_FILE, "r");
+    if (!f) {
+        char buf[300];
+        std::snprintf(buf, sizeof(buf),
+            "renodx-engine: index '%s' not found — per-texture lookup disabled, "
+            "falling back to default brick normal for all surfaces", TEXTURE_INDEX_FILE);
+        reshade::log::message(reshade::log::level::warning, buf);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> g(g_index_mu);
+    g_hash_to_path.clear();
+    char line[1100];
+    size_t n = 0, n_skip = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        char hex[24] = {0};
+        char path[1024] = {0};
+        if (std::sscanf(line, "%23s %1023[^\r\n]", hex, path) != 2) { ++n_skip; continue; }
+        char* endp = nullptr;
+        uint64_t h = std::strtoull(hex, &endp, 16);
+        if (!h || endp == hex) { ++n_skip; continue; }
+        g_hash_to_path.emplace(h, path);
+        ++n;
+    }
+    std::fclose(f);
+
+    char buf[200];
+    std::snprintf(buf, sizeof(buf),
+        "renodx-engine: index loaded — %zu entries (skipped %zu) from '%s'; corpus dir = '%s'",
+        n, n_skip, TEXTURE_INDEX_FILE, g_normal_corpus_dir.c_str());
+    reshade::log::message(reshade::log::level::info, buf);
+    return true;
+}
+
+const std::string* lookup_normal_path(uint64_t hash) {
+    std::lock_guard<std::mutex> g(g_index_mu);
+    auto it = g_hash_to_path.find(hash);
+    return it != g_hash_to_path.end() ? &it->second : nullptr;
+}
+
+// Lazy load a normal map for the given hash. Returns nullptr if not in
+// index, file missing, or D3D9 upload failed (also caches the miss).
+IDirect3DTexture9* get_or_load_normal(IDirect3DDevice9* dev, uint64_t hash) {
+    {
+        std::lock_guard<std::mutex> g(g_normal_cache_mu);
+        auto it = g_normal_cache.find(hash);
+        if (it != g_normal_cache.end()) return it->second;   // may be nullptr (cached miss)
+    }
+
+    const std::string* rel = lookup_normal_path(hash);
+    if (!rel) {
+        std::lock_guard<std::mutex> g(g_normal_cache_mu);
+        g_normal_cache.emplace(hash, nullptr);
+        return nullptr;
+    }
+
+    std::string full = g_normal_corpus_dir + *rel;
+    // Convert forward slashes (from index built on Linux) to Windows-style
+    // for stbi_load — Wine accepts either, but be safe.
+    for (auto& c : full) if (c == '/') c = '\\';
+
+    int w = 0, h = 0, ch = 0;
+    unsigned char* px = stbi_load(full.c_str(), &w, &h, &ch, 4);
+    if (!px) {
+        char buf[400];
+        std::snprintf(buf, sizeof(buf),
+            "renodx-engine: stbi_load FAILED for normal %s (hash %016llx): %s",
+            full.c_str(), (unsigned long long)hash, stbi_failure_reason());
+        reshade::log::message(reshade::log::level::warning, buf);
+        std::lock_guard<std::mutex> g(g_normal_cache_mu);
+        g_normal_cache.emplace(hash, nullptr);
+        return nullptr;
+    }
+
+    IDirect3DTexture9* tex = nullptr;
+    HRESULT hr = dev->CreateTexture((UINT)w, (UINT)h, 1, 0,
+        D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr);
+    if (FAILED(hr) || !tex) {
+        stbi_image_free(px);
+        std::lock_guard<std::mutex> g(g_normal_cache_mu);
+        g_normal_cache.emplace(hash, nullptr);
+        return nullptr;
+    }
+
+    D3DLOCKED_RECT lr;
+    if (FAILED(tex->LockRect(0, &lr, nullptr, 0))) {
+        tex->Release();
+        stbi_image_free(px);
+        std::lock_guard<std::mutex> g(g_normal_cache_mu);
+        g_normal_cache.emplace(hash, nullptr);
+        return nullptr;
+    }
+    // RGBA → BGRA (D3DFMT_A8R8G8B8 byte order in memory)
+    for (int y = 0; y < h; ++y) {
+        uint8_t* dst = (uint8_t*)lr.pBits + y * lr.Pitch;
+        const unsigned char* src = px + y * w * 4;
+        for (int x = 0; x < w; ++x) {
+            dst[x*4 + 0] = src[x*4 + 2];
+            dst[x*4 + 1] = src[x*4 + 1];
+            dst[x*4 + 2] = src[x*4 + 0];
+            dst[x*4 + 3] = src[x*4 + 3];
+        }
+    }
+    tex->UnlockRect(0);
+    stbi_image_free(px);
+
+    {
+        std::lock_guard<std::mutex> g(g_normal_cache_mu);
+        // Crude cap: if too many entries, evict an arbitrary live one.
+        // LRU not worth the complexity for a 256-entry budget on a 2004 game.
+        if (g_normal_cache.size() >= NORMAL_CACHE_MAX) {
+            for (auto it = g_normal_cache.begin(); it != g_normal_cache.end(); ++it) {
+                if (it->second) {
+                    it->second->Release();
+                    g_normal_cache.erase(it);
+                    break;
+                }
+            }
+        }
+        g_normal_cache[hash] = tex;
+    }
+
+    uint64_t n = g_lazy_loaded.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n % 50) == 0) {
+        char buf[400];
+        std::snprintf(buf, sizeof(buf),
+            "renodx-engine: lazy-loaded normal #%llu hash=%016llx %dx%d → %s",
+            (unsigned long long)n, (unsigned long long)hash, w, h, rel->c_str());
+        reshade::log::message(reshade::log::level::info, buf);
+    }
+    return tex;
+}
+
 // ── pipeline tracking ────────────────────────────────────────────────
 std::mutex g_pipe_mu;
 std::unordered_map<uint64_t, uint32_t> g_ps_pipeline_to_crc;
@@ -289,32 +472,164 @@ void on_bind_pipeline_states(reshade::api::command_list*,
             t_z_enabled = (values[i] != 0);
 }
 
+// ── m4 resource hashing ─────────────────────────────────────────────
+//
+// We tried map/unmap_texture_region first — D3D9's CreateTexture has
+// no initial_data, so we used the LockRect/UnlockRect events to hash
+// the upload. That crashed: DXVK appears to release the staging
+// buffer mapping by the time ReShade fires unmap_texture_region, so
+// reading the captured pointer hits unmapped memory → SEGV.
+//
+// Current approach: hash on first bind. When bind_normal_for_draw
+// sees a texture at sampler 0 we haven't seen before, QueryInterface
+// to IDirect3DTexture9, LockRect(D3DLOCK_READONLY) to get the system-
+// memory copy (POOL_MANAGED has one; POOL_DEFAULT may not, in which
+// case LockRect fails and we cache hash=0 = "miss"). Each game
+// texture is hashed exactly once over its lifetime.
+//
+// init_resource is still wired so we can short-circuit on dims, but
+// it's no longer the primary hash trigger.
+
+struct ResourceDims { uint32_t w, h; reshade::api::resource_type type; };
+
+std::mutex g_resource_dims_mu;
+std::unordered_map<uint64_t, ResourceDims> g_resource_dims;
+
+void on_init_resource(reshade::api::device*,
+                      const reshade::api::resource_desc& desc,
+                      const reshade::api::subresource_data* initial_data,
+                      reshade::api::resource_usage,
+                      reshade::api::resource resource) {
+    if (desc.type != reshade::api::resource_type::texture_2d) return;
+
+    {
+        std::lock_guard<std::mutex> g(g_resource_dims_mu);
+        g_resource_dims[resource.handle] =
+            { desc.texture.width, desc.texture.height, desc.type };
+    }
+
+    // Rare path — if D3D9 ever passes initial_data (non-D3D9 backends do),
+    // hash directly here.
+    if (!initial_data || !initial_data->data) return;
+    size_t avail = initial_data->slice_pitch
+                     ? (size_t)initial_data->slice_pitch
+                     : (size_t)initial_data->row_pitch * desc.texture.height;
+    if (avail == 0) return;
+    uint64_t hash = hash_pixels(initial_data->data, avail,
+                                desc.texture.width, desc.texture.height);
+    if (!hash) return;
+    {
+        std::lock_guard<std::mutex> g(g_resource_mu);
+        g_resource_to_hash[resource.handle] = hash;
+    }
+    if (lookup_normal_path(hash))
+        g_index_hits.fetch_add(1, std::memory_order_relaxed);
+    else
+        g_index_misses.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Hash a D3D9 texture by locking its level-0 system-memory copy.
+// Returns 0 on any failure (LockRect failed, dims invalid, etc.).
+// Caller is responsible for caching the result so we only do this
+// once per resource lifetime.
+uint64_t hash_d3d9_texture(IDirect3DBaseTexture9* base) {
+    if (!base) return 0;
+
+    IDirect3DTexture9* tex2d = nullptr;
+    if (FAILED(base->QueryInterface(__uuidof(IDirect3DTexture9), (void**)&tex2d)) || !tex2d)
+        return 0;
+
+    uint64_t hash = 0;
+    D3DSURFACE_DESC desc{};
+    if (SUCCEEDED(tex2d->GetLevelDesc(0, &desc))) {
+        D3DLOCKED_RECT lr{};
+        if (SUCCEEDED(tex2d->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) {
+            size_t avail = (size_t)lr.Pitch * desc.Height;
+            if (lr.pBits && avail > 0)
+                hash = hash_pixels(lr.pBits, avail, desc.Width, desc.Height);
+            tex2d->UnlockRect(0);
+        }
+    }
+    tex2d->Release();
+    return hash;
+}
+
+void on_destroy_resource(reshade::api::device*, reshade::api::resource resource) {
+    {
+        std::lock_guard<std::mutex> g(g_resource_mu);
+        g_resource_to_hash.erase(resource.handle);
+    }
+    {
+        std::lock_guard<std::mutex> g(g_resource_dims_mu);
+        g_resource_dims.erase(resource.handle);
+    }
+    // Normal cache is keyed on hash, not resource — leave it intact.
+}
+
 std::atomic<uint64_t> g_world_draws{0};
+std::atomic<uint64_t> g_world_draws_per_tex_hit{0};
 
 inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
-    if (!t_using_substituted_world_ps || !t_z_enabled || !g_default_normal) return;
+    if (!t_using_substituted_world_ps || !t_z_enabled) return;
     auto* dev = reinterpret_cast<IDirect3DDevice9*>(cmd->get_device()->get_native());
     if (!dev) return;
-    dev->SetTexture(NORMAL_SAMPLER, g_default_normal);
+
+    // Resolve which normal to bind from whatever the game just put on s0.
+    IDirect3DTexture9* normal = nullptr;
+    IDirect3DBaseTexture9* albedo = nullptr;
+    dev->GetTexture(0, &albedo);
+    if (albedo) {
+        uint64_t handle = (uint64_t)albedo;
+        uint64_t hash   = 0;
+        bool need_hash  = false;
+        {
+            std::lock_guard<std::mutex> g(g_resource_mu);
+            auto it = g_resource_to_hash.find(handle);
+            if (it != g_resource_to_hash.end()) hash = it->second;
+            else need_hash = true;
+        }
+        if (need_hash) {
+            // First time we've seen this albedo bound — hash it now.
+            // hash_d3d9_texture returns 0 if LockRect fails (e.g.
+            // POOL_DEFAULT without a system copy), which we cache as
+            // "miss" to avoid re-trying every draw.
+            hash = hash_d3d9_texture(albedo);
+            {
+                std::lock_guard<std::mutex> g(g_resource_mu);
+                g_resource_to_hash[handle] = hash;
+            }
+            if (hash) {
+                if (lookup_normal_path(hash))
+                    g_index_hits.fetch_add(1, std::memory_order_relaxed);
+                else
+                    g_index_misses.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (hash) normal = get_or_load_normal(dev, hash);
+        albedo->Release();
+    }
+
+    bool per_tex = normal != nullptr;
+    if (!normal) normal = g_default_normal;
+    if (!normal) return;   // nothing to bind, leave shader sampling whatever's there
+
+    dev->SetTexture(NORMAL_SAMPLER, normal);
     dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSU,  D3DTADDRESS_WRAP);
     dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSV,  D3DTADDRESS_WRAP);
     dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 
-    // Diagnostic: log GetTexture once to verify our bind took effect
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
-        IDirect3DBaseTexture9* current = nullptr;
-        dev->GetTexture(NORMAL_SAMPLER, &current);
-        char buf[200];
-        std::snprintf(buf, sizeof(buf),
-            "renodx-engine: SetTexture(%u, %p) → GetTexture returned %p (match=%d)",
-            NORMAL_SAMPLER, (void*)g_default_normal, (void*)current,
-            current == g_default_normal ? 1 : 0);
-        reshade::log::message(reshade::log::level::info, buf);
-        if (current) current->Release();
-    }
     g_world_draws.fetch_add(1, std::memory_order_relaxed);
+    if (per_tex) {
+        uint64_t n = g_world_draws_per_tex_hit.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                "renodx-engine: FIRST per-texture normal bound (resource=%p tex=%p)",
+                (void*)albedo, (void*)normal);
+            reshade::log::message(reshade::log::level::info, buf);
+        }
+    }
 }
 
 bool on_draw(reshade::api::command_list* cmd, uint32_t, uint32_t, uint32_t, uint32_t) {
@@ -336,12 +651,18 @@ void on_present(reshade::api::effect_runtime* rt) {
     }
     uint64_t f = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((f % 1800) == 0) {
-        char buf[200];
+        char buf[400];
         std::snprintf(buf, sizeof(buf),
-            "renodx-engine: frames=%llu replacements=%llu world-draws=%llu normal-loaded=%d",
+            "renodx-engine: frames=%llu replacements=%llu world-draws=%llu(per-tex %llu) "
+            "index-hits=%llu/misses=%llu lazy-loaded=%llu cache-size=%zu default-normal=%d",
             (unsigned long long)f,
             (unsigned long long)g_replacements_done.load(),
             (unsigned long long)g_world_draws.load(),
+            (unsigned long long)g_world_draws_per_tex_hit.load(),
+            (unsigned long long)g_index_hits.load(),
+            (unsigned long long)g_index_misses.load(),
+            (unsigned long long)g_lazy_loaded.load(),
+            g_normal_cache.size(),
             g_default_normal ? 1 : 0);
         reshade::log::message(reshade::log::level::info, buf);
     }
@@ -351,33 +672,45 @@ void on_present(reshade::api::effect_runtime* rt) {
 
 extern "C" __declspec(dllexport) const char* NAME = "neocron-renodx-engine";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
-    "Tier 4 m3 PoC — normal-mapped Phong on world.ps via single brick normal at sampler 2";
+    "Tier 4 m4 — per-texture normal-mapped Phong on world.ps. "
+    "Hashes every game texture at creation, looks up matching AI-generated "
+    "normal map from the offline corpus, binds at sampler 5.";
 
 BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
             if (!reshade::register_addon(hmod)) return FALSE;
             compile_replacement();
+            load_texture_index();
             reshade::register_event<reshade::addon_event::create_pipeline>(on_create_pipeline);
             reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
             reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
             reshade::register_event<reshade::addon_event::bind_pipeline_states>(on_bind_pipeline_states);
+            reshade::register_event<reshade::addon_event::init_resource>(on_init_resource);
+            reshade::register_event<reshade::addon_event::destroy_resource>(on_destroy_resource);
             reshade::register_event<reshade::addon_event::draw>(on_draw);
             reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m3 v0.3 (normal-mapped Phong) registered");
+                "renodx-engine: m4 v0.4 (per-texture lookup via on-bind LockRect) registered");
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_event<reshade::addon_event::reshade_present>(on_present);
             reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
             reshade::unregister_event<reshade::addon_event::draw>(on_draw);
+            reshade::unregister_event<reshade::addon_event::destroy_resource>(on_destroy_resource);
+            reshade::unregister_event<reshade::addon_event::init_resource>(on_init_resource);
             reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(on_bind_pipeline_states);
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
             reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
             reshade::unregister_event<reshade::addon_event::create_pipeline>(on_create_pipeline);
             reshade::unregister_addon(hmod);
             if (g_default_normal) { g_default_normal->Release(); g_default_normal = nullptr; }
+            {
+                std::lock_guard<std::mutex> g(g_normal_cache_mu);
+                for (auto& kv : g_normal_cache) if (kv.second) kv.second->Release();
+                g_normal_cache.clear();
+            }
             if (g_d3dc) FreeLibrary(g_d3dc);
             break;
     }

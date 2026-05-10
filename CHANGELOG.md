@@ -1,5 +1,78 @@
 # Changelog
 
+## [0.4.0] — 2026-05-10
+
+Tier 4 milestone 4 — **per-texture normal lookup**. Each world surface
+now gets its own AI-generated normal map instead of the universal
+brick from m3.
+
+### Distribution change
+
+The texture index (`neocron_texture_index.txt`) and the ~1.9 GB AI
+normal corpus are now shipped by the **nc2-hd-textures** addon (since
+they're paired with the HD albedos that produced them). This addon
+ships only the engine binary + the brick fallback normal. With
+nc2-hd-textures installed, per-texture normals work; without it, all
+world surfaces fall back to the brick normal (still better than flat).
+
+Stock vanilla world-only normals as engine-bundled fallback are TODO.
+
+### How it works
+
+1. `scripts/build-hash-index.py` walks the source corpus (`nc2-hd-textures/gfx/`),
+   PAK-decompresses each `.dds`/`.bmp`, strips the file header, computes
+   `(crc32(first_4 KB_pixels) << 32) | (width << 16) | height`, and
+   matches it to the sibling `_n.png` from `_normal_pipeline/output/`.
+   Output: `assets/texture_index.txt` (~115 KB, 2857 entries).
+
+2. At addon load, the runtime parses the `.txt` into a `uint64_t →
+   path` map.
+
+3. Hashing happens **on first bind** in `bind_normal_for_draw`:
+   `IDirect3DDevice9::GetTexture(0)` → QueryInterface to
+   IDirect3DTexture9 → `LockRect(D3DLOCK_READONLY)` on the system-
+   memory copy (POOL_MANAGED has one) → CRC32 of first 4 KB of raw
+   pixel bytes. Each game texture is hashed exactly once over its
+   lifetime; cached forever after.
+
+   We tried using ReShade's `map_texture_region` / `unmap_texture_region`
+   events first, but DXVK appears to release the staging buffer
+   mapping by the time `unmap_texture_region` fires, so reading the
+   captured pointer hit unmapped memory → SEGV. The on-bind LockRect
+   approach is robust because the system-memory copy stays valid for
+   the texture's whole lifetime.
+
+4. `addon_event::draw[_indexed]` calls `dev->GetTexture(0, …)` to find
+   the albedo bound for the current world.ps draw, looks up its hash,
+   resolves the `_n.png` path, lazy-loads it via `stb_image` +
+   `CreateTexture` (LRU-capped at 256 entries), and binds at sampler 5.
+
+5. Hash unknown → falls back to the v0.3 brick normal (still useful as
+   "something is bumpy" baseline).
+
+### HLSL change
+
+Tiling factor dropped from 4× to 1× — per-texture normals match the
+albedo's UV layout 1:1.
+
+### Distribution
+
+- `assets/texture_index.txt` (115 KB) is shipped with the addon.
+- The `~2900 _n.png` files (~1.9 GB) are NOT shipped — too large.
+  Default search path is the dev machine's
+  `Z:/home/javier/Documents/Projects/Neocron/_normal_pipeline/output/`.
+  Override via env var `NEOCRON_NORMALS_DIR`. Future work: launcher-
+  managed addon payload or DDS-compressed corpus distribution.
+
+### Diagnostics
+
+`reshade.log` reports every 1800 frames:
+```
+frames=N replacements=N world-draws=N(per-tex H) index-hits=H/misses=M
+lazy-loaded=L cache-size=C default-normal=1
+```
+Use the `per-tex` count to verify per-texture binding rate.
+
 ## [0.3.0] — 2026-05-10
 
 Tier 4 milestone 3 PoC — actual normal-mapped Phong replacement of
