@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.4.6] — 2026-05-10
+
+Scene-reactive lighting (lightmap-derived sun direction) + view-
+dependent specular & rim. The bumps were "static" before because we
+shaded against a hardcoded sun direction; now they respond to the
+level's actual baked lighting AND to camera motion.
+
+### How
+- **Lightmap-gradient sun**: for every pixel, sample the lightmap at
+  4 nearby UVs, take the luminance gradient, use `-∇L` as the local
+  light direction in tangent space. Bumps now point toward whatever
+  the level designer baked as bright (neon signs, windows, etc.).
+- **VPOS-derived view direction**: upgraded both replacement shaders
+  to ps_3_0 (DXVK supports trivially) so we can read the screen
+  position via the VPOS semantic. Combined with the screen size
+  (refreshed every frame from `GetViewport`), gives a per-pixel
+  approximation of the view ray in tangent space.
+- **Half-vector specular**: Phong-style highlights using the lightmap-
+  driven `L` and the VPOS-driven `V`. Highlights now slide across
+  surfaces as you turn the camera.
+- **Fresnel rim**: `pow(1 - N·V, 3)` puts a soft glow on grazing
+  edges of bump features.
+
+### New ImGui sliders
+Scene-reactive lighting:
+- Lightmap-driven (vs fixed sun) — 0..1 blend
+- Gradient amp — 0..20 (4 default)
+- Lightmap tap offset — 0.001..0.02
+
+View-dependent specular:
+- Specular strength — 0..2 (0.4 default)
+- Specular shininess — 1..128 (16 default)
+- Rim strength — 0..2 (0.3 default)
+
+### New constants (PS register layout)
+- c22 = (lm_driven, lm_amp, spec_strength, spec_shininess)
+- c23 = (rim_strength, lm_tap_offset, screen_inv_w, screen_inv_h)
+
+mesh.ps gets the same spec+rim treatment but no lightmap (it doesn't
+sample one), so it falls back to the fixed sun direction for the L.
+
 ## [0.4.5] — 2026-05-10
 
 Two fixes for v0.4.4 user feedback.

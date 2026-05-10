@@ -75,10 +75,11 @@ constexpr const char* STOCK_CORPUS_DIR  = "gfx_normals_stock\\";
 constexpr size_t HASH_SAMPLE_BYTES = 4096;  // must match build-hash-index.py
 constexpr size_t NORMAL_CACHE_MAX  = 256;   // cap LRU; ~50 MB for typical 256² normals
 
-// Pixel-shader constant register for our params — picked to NOT collide with
-// game's world.ps which uses c0..c7 for color correction etc.
+// Pixel-shader constant registers — c0..c7 reserved for game's world.ps.
 constexpr UINT  PARAMS_PS_REG = 20;   // c20 = bump_amp, light_min, light_max, debug_mode
-constexpr UINT  SUN_PS_REG    = 21;   // c21 = sun direction (tangent space)
+constexpr UINT  SUN_PS_REG    = 21;   // c21 = sun direction xyz + bump_on flag w
+constexpr UINT  EXTRA_PS_REG  = 22;   // c22 = lm_driven, lm_amp, spec_strength, spec_shininess
+constexpr UINT  EXTRA2_PS_REG = 23;   // c23 = rim_strength, lm_tap_offset, screen_inv_w, screen_inv_h
 
 // Tunables (default values; hotkeys mutate at runtime)
 struct Tunables {
@@ -93,19 +94,44 @@ std::atomic<float> g_bump_amp{5.0f};
 std::atomic<float> g_light_min{0.20f};
 std::atomic<float> g_light_max{1.50f};
 std::atomic<int>   g_debug_mode{0};
-// Sun direction is fixed for now (no F-key tweak yet); kept in defaults.
+
+// New v0.4.6 scene-reactive tunables
+std::atomic<float> g_lm_driven   {1.0f};   // 0=fixed sun, 1=lightmap-gradient sun
+std::atomic<float> g_lm_amp      {4.0f};   // gradient amplification
+std::atomic<float> g_spec_strength{0.4f};
+std::atomic<float> g_spec_shiny  {16.0f};
+std::atomic<float> g_rim_strength{0.3f};
+std::atomic<float> g_lm_tap      {0.005f}; // UV step for gradient sampling
+
+// Tracked screen size, refreshed each present.
+std::atomic<float> g_screen_inv_w{1.0f / 1920.0f};
+std::atomic<float> g_screen_inv_h{1.0f / 1080.0f};
+
+// Fallback sun direction (used when LM_DRIVEN < 1.0)
 constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
 
-// m4 v0.4.5 — pixel-shader constants used by BOTH world.ps and mesh.ps
-// replacements. Game uses c0..c7, so we go to c20+ to avoid collision.
-//   c20.x = BUMP_AMP    (XY tilt amplification, 0.5..15)
-//   c20.y = LIGHT_MIN   (light value at NdotL=0, default 0.2)
-//   c20.z = LIGHT_MAX   (light value at NdotL=1, default 1.5)
-//   c20.w = DEBUG_MODE  (0=lit, 1=raw normal RGB, 2=NdotL gray, 3=albedo only)
-//   c21.xyz = SUN_TS    (tangent-space sun, normalised)
-//   c21.w = BUMP_ON     (1 = use per-tex normal; 0 = pass-through vanilla)
+// m4 v0.4.6 — scene-reactive lighting via lightmap-derived sun + view-
+// dependent specular via VPOS-derived view direction.
 //
-// world.ps replacement (lit world geometry, lightmap-sampled).
+// Pixel-shader constants (c0..c7 reserved for game's world.ps):
+//   c20.x = BUMP_AMP        (XY normal tilt, 0.5..15)
+//   c20.y = LIGHT_MIN       (Lambertian floor)
+//   c20.z = LIGHT_MAX       (Lambertian ceiling)
+//   c20.w = DEBUG_MODE      (0=lit, 1=raw normal, 2=NdotL gray, 3=albedo)
+//   c21.xyz = SUN_TS_FALLBACK   (used when LM_DRIVEN=0)
+//   c21.w   = BUMP_ON       (1=per-tex active, 0=pass-through vanilla)
+//   c22.x = LM_DRIVEN       (0=fixed sun, 1=lightmap-gradient sun)
+//   c22.y = LM_GRAD_AMP     (gradient amplification, default 4)
+//   c22.z = SPEC_STRENGTH   (specular blend, default 0.4)
+//   c22.w = SPEC_SHININESS  (Phong exponent, default 16)
+//   c23.x = RIM_STRENGTH    (fresnel rim, default 0.3)
+//   c23.y = LM_TAP_OFFSET   (UV offset for gradient samples, default 0.005)
+//   c23.zw  = SCREEN_SIZE   (1.0/width, 1.0/height — for VPOS view dir)
+//
+// Both world.ps and mesh.ps compile to ps_3_0 (DXVK supports trivially)
+// so we get VPOS for screen-position-derived view direction.
+//
+// world.ps replacement
 const char* WORLD_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);
 sampler2D samplerLightmap : register(s1);
@@ -113,35 +139,68 @@ sampler2D samplerNormal   : register(s5);
 
 float4 g_params : register(c20);
 float4 g_sun    : register(c21);
+float4 g_extra  : register(c22);
+float4 g_extra2 : register(c23);
 
-float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1, float4 vcol : COLOR0) : COLOR {
+float luminance(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+
+float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1,
+            float4 vcol : COLOR0, float2 vpos : VPOS) : COLOR {
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
     float4 vanilla  = saturate(albedo * lightmap * 2.0);
 
-    // BUMP_ON=0 → skip the per-tex normal entirely, output vanilla colour.
     if (g_sun.w < 0.5) return vanilla;
 
+    // --- Normal in tangent space, with XY amplified ---
     float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
-    float3 n_ts  = float3(n_raw.xy * g_params.x, n_raw.z);
-    n_ts = normalize(n_ts);
+    float3 n_ts  = normalize(float3(n_raw.xy * g_params.x, n_raw.z));
 
-    float NdotL = saturate(dot(n_ts, g_sun.xyz));
-    float light = lerp(g_params.y, g_params.z, NdotL);
-    float4 lit  = saturate(vanilla * light);
+    // --- Light direction: blend fixed sun ↔ lightmap gradient ---
+    float lm_d = g_extra.x;     // 0=fixed, 1=full lightmap-driven
+    float lm_a = g_extra.y;
+    float d    = g_extra2.y;
+    float L_c = luminance(lightmap.rgb);
+    float L_r = luminance(tex2D(samplerLightmap, uv_lm + float2(d, 0)).rgb);
+    float L_u = luminance(tex2D(samplerLightmap, uv_lm + float2(0, d)).rgb);
+    float2 grad = float2(L_r - L_c, L_u - L_c) * lm_a;
+    float3 sun_dyn = normalize(float3(-grad, 1.0));   // light comes FROM the brighter direction
+    float3 L = normalize(lerp(g_sun.xyz, sun_dyn, lm_d));
 
+    // --- View direction approx from VPOS (screen pos) ---
+    // Vector from screen center to current pixel, in tangent space approx.
+    float2 ndc = vpos.xy * g_extra2.zw * 2.0 - 1.0;  // -1..1
+    float3 V   = normalize(float3(-ndc.x, ndc.y, 1.5));    // forward + screen offset
+
+    // --- Diffuse Lambertian ---
+    float NdotL = saturate(dot(n_ts, L));
+    float diff  = lerp(g_params.y, g_params.z, NdotL);
+
+    // --- View-dependent half-vector specular ---
+    float3 H     = normalize(L + V);
+    float NdotH  = saturate(dot(n_ts, H));
+    float spec   = pow(NdotH, max(1.0, g_extra.w)) * g_extra.z;
+
+    // --- Fresnel rim (face-on = 0, grazing = strong) ---
+    float NdotV  = saturate(dot(n_ts, V));
+    float rim    = pow(1.0 - NdotV, 3.0) * g_extra2.x;
+
+    // --- Compose ---
+    float3 lit_rgb = vanilla.rgb * diff
+                   + lightmap.rgb * spec * 2.0
+                   + rim;
+
+    // --- Debug viz ---
     float mode = g_params.w;
     if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0);
     if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);
     if (mode > 2.5)                return albedo;
-    return lit;
+    return float4(saturate(lit_rgb), albedo.a);
 }
 )hlsl";
 
-// mesh.ps replacement (CRC 0x96f566cb) — generic textured PS used by
-// NPCs, characters, items, decals, signs, AND HUD overlays. We bind
-// normals only when t_z_enabled (3D world geometry); HUD draws have
-// Z-test off, so the binding skips and these draws use vanilla output.
+// mesh.ps replacement — same scheme, no lightmap (mesh.ps only has albedo).
+// Lightmap-derived light direction not available; use fixed sun only.
 constexpr uint32_t MESH_PS_CRC = 0x96f566cbu;
 const char* MESH_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo : register(s0);
@@ -149,26 +208,40 @@ sampler2D samplerNormal : register(s5);
 
 float4 g_params : register(c20);
 float4 g_sun    : register(c21);
+float4 g_extra  : register(c22);
+float4 g_extra2 : register(c23);
 
-float4 main(float2 uv : TEXCOORD0, float4 vcol : COLOR0) : COLOR {
+float4 main(float2 uv : TEXCOORD0, float4 vcol : COLOR0,
+            float2 vpos : VPOS) : COLOR {
     float4 albedo  = tex2D(samplerAlbedo, uv);
     float4 vanilla = albedo * vcol;
 
     if (g_sun.w < 0.5) return vanilla;
 
     float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
-    float3 n_ts  = float3(n_raw.xy * g_params.x, n_raw.z);
-    n_ts = normalize(n_ts);
+    float3 n_ts  = normalize(float3(n_raw.xy * g_params.x, n_raw.z));
 
-    float NdotL = saturate(dot(n_ts, g_sun.xyz));
-    float light = lerp(g_params.y, g_params.z, NdotL);
-    float4 lit  = saturate(vanilla * light);
+    float3 L = normalize(g_sun.xyz);
+    float2 ndc = vpos.xy * g_extra2.zw * 2.0 - 1.0;
+    float3 V   = normalize(float3(-ndc.x, ndc.y, 1.5));
+
+    float NdotL = saturate(dot(n_ts, L));
+    float diff  = lerp(g_params.y, g_params.z, NdotL);
+
+    float3 H    = normalize(L + V);
+    float NdotH = saturate(dot(n_ts, H));
+    float spec  = pow(NdotH, max(1.0, g_extra.w)) * g_extra.z;
+
+    float NdotV = saturate(dot(n_ts, V));
+    float rim   = pow(1.0 - NdotV, 3.0) * g_extra2.x;
+
+    float3 lit_rgb = vanilla.rgb * diff + spec.xxx * 0.5 + rim.xxx;
 
     float mode = g_params.w;
     if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0);
     if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);
     if (mode > 2.5)                return albedo;
-    return lit;
+    return float4(saturate(lit_rgb), albedo.a);
 }
 )hlsl";
 
@@ -197,8 +270,10 @@ std::atomic<uint64_t> g_replacements_done{0};
 bool compile_one(const char* hlsl, const char* tag, std::vector<uint8_t>& out) {
     ID3DBlob* code = nullptr;
     ID3DBlob* errs = nullptr;
+    // ps_3_0 needed for VPOS semantic (screen-position-derived view direction).
+    // DXVK supports it trivially on Polaris; original game used ps_2_0.
     HRESULT hr = g_D3DCompile(hlsl, std::strlen(hlsl), tag,
-        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &errs);
+        nullptr, nullptr, "main", "ps_3_0", 0, 0, &code, &errs);
     if (FAILED(hr) || !code) {
         char buf[400];
         std::snprintf(buf, sizeof(buf),
@@ -740,16 +815,26 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     }
 
-    // Push tunables to pixel-shader constants. Cheap (8 floats per draw).
+    // Push tunables to pixel-shader constants. ~16 floats per draw, cheap.
     float params[4] = {
         g_bump_amp.load(std::memory_order_relaxed),
         g_light_min.load(std::memory_order_relaxed),
         g_light_max.load(std::memory_order_relaxed),
         (float)g_debug_mode.load(std::memory_order_relaxed)
     };
+    float sun[4]    = { SUN_X, SUN_Y, SUN_Z, per_tex ? 1.0f : 0.0f };
+    float extra[4]  = {
+        g_lm_driven.load(),  g_lm_amp.load(),
+        g_spec_strength.load(), g_spec_shiny.load()
+    };
+    float extra2[4] = {
+        g_rim_strength.load(), g_lm_tap.load(),
+        g_screen_inv_w.load(), g_screen_inv_h.load()
+    };
     dev->SetPixelShaderConstantF(PARAMS_PS_REG, params, 1);
-    float sun[4] = { SUN_X, SUN_Y, SUN_Z, per_tex ? 1.0f : 0.0f };
-    dev->SetPixelShaderConstantF(SUN_PS_REG, sun, 1);
+    dev->SetPixelShaderConstantF(SUN_PS_REG,    sun,    1);
+    dev->SetPixelShaderConstantF(EXTRA_PS_REG,  extra,  1);
+    dev->SetPixelShaderConstantF(EXTRA2_PS_REG, extra2, 1);
 
     g_world_draws.fetch_add(1, std::memory_order_relaxed);
     if (per_tex) {
@@ -807,11 +892,35 @@ void on_overlay(reshade::api::effect_runtime*) {
     };
     if (ImGui::Combo("Debug viz", &mode, MODES, IM_ARRAYSIZE(MODES))) g_debug_mode.store(mode);
 
+    ImGui::Separator();
+    ImGui::TextUnformatted("Scene-reactive lighting");
+    float lmd = g_lm_driven.load();
+    float lma = g_lm_amp.load();
+    float lmt = g_lm_tap.load();
+    if (ImGui::SliderFloat("Lightmap-driven (vs fixed sun)", &lmd, 0.0f, 1.0f, "%.2f")) g_lm_driven.store(lmd);
+    if (ImGui::SliderFloat("Gradient amp",                   &lma, 0.0f, 20.0f, "%.1f")) g_lm_amp.store(lma);
+    if (ImGui::SliderFloat("Lightmap tap offset",            &lmt, 0.001f, 0.02f, "%.4f")) g_lm_tap.store(lmt);
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("View-dependent specular");
+    float ss = g_spec_strength.load();
+    float sh = g_spec_shiny.load();
+    float rs = g_rim_strength.load();
+    if (ImGui::SliderFloat("Specular strength",  &ss, 0.0f, 2.0f,  "%.2f")) g_spec_strength.store(ss);
+    if (ImGui::SliderFloat("Specular shininess", &sh, 1.0f, 128.0f,"%.0f")) g_spec_shiny.store(sh);
+    if (ImGui::SliderFloat("Rim strength",       &rs, 0.0f, 2.0f,  "%.2f")) g_rim_strength.store(rs);
+
     if (ImGui::Button("Reset to defaults")) {
         g_bump_amp.store(5.0f);
         g_light_min.store(0.20f);
         g_light_max.store(1.50f);
         g_debug_mode.store(0);
+        g_lm_driven.store(1.0f);
+        g_lm_amp.store(4.0f);
+        g_lm_tap.store(0.005f);
+        g_spec_strength.store(0.4f);
+        g_spec_shiny.store(16.0f);
+        g_rim_strength.store(0.3f);
         log_tunables("ImGui reset");
     }
 
@@ -833,6 +942,18 @@ void on_present(reshade::api::effect_runtime* rt) {
     if (!g_default_normal && rt) {
         auto* dev = reinterpret_cast<IDirect3DDevice9*>(rt->get_device()->get_native());
         if (dev) load_default_normal(dev);
+    }
+    // Refresh screen size for VPOS-based view-direction calc. Cheap; only
+    // changes on resize but covers windowed-mode resizes for free.
+    if (rt) {
+        auto* dev = reinterpret_cast<IDirect3DDevice9*>(rt->get_device()->get_native());
+        if (dev) {
+            D3DVIEWPORT9 vp{};
+            if (SUCCEEDED(dev->GetViewport(&vp)) && vp.Width && vp.Height) {
+                g_screen_inv_w.store(1.0f / (float)vp.Width,  std::memory_order_relaxed);
+                g_screen_inv_h.store(1.0f / (float)vp.Height, std::memory_order_relaxed);
+            }
+        }
     }
     uint64_t f = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((f % 1800) == 0) {
@@ -878,7 +999,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.4.5 (world.ps + mesh.ps; flat fallback; ImGui overlay) registered");
+                "renodx-engine: m4 v0.4.6 (ps_3_0 + lightmap-driven sun + view-dependent spec/rim) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
