@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.4] — 2026-05-10
+
+Switched from F2-F6/F11 hotkeys to ImGui sliders in the ReShade overlay.
+F-keys collide with NC2's HUD shortcuts (F1-F12 reserved by the game).
+
+### What's new
+- Vendored ImGui v1.92.5-docking headers (`src/include/imgui.h`,
+  `imconfig.h`) — ReShade SDK requires the docking-branch types.
+- New addon overlay tab: **ReShade overlay (Home) → Add-ons → Neocron
+  RenoDX Engine** has `Bump amp`, `Light min`, `Light max`, `Debug viz`
+  combobox, `Reset` button, and live stats (world draws, per-tex
+  hits, index hits/misses, lazy-loaded count, cache size).
+- Removed `poll_hotkeys` + the F-key polling in `on_present`.
+
+### Build change
+`src/Makefile` already adds `-Iinclude`; no further changes needed,
+ImGui is header-only.
+
 ## [0.4.3] — 2026-05-10
 
 Runtime-tunable HLSL params + debug viz modes via in-game hotkeys.

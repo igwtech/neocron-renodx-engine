@@ -29,6 +29,11 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
+// ImGui must come BEFORE reshade.hpp so reshade_overlay.hpp picks it up.
+// IMGUI_VERSION_NUM in our vendored header (1.92.5) must match what
+// reshade_overlay.hpp expects (currently 19250).
+#define ImTextureID ImU64
+#include "imgui.h"
 #include <reshade.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -731,35 +736,47 @@ void log_tunables(const char* trigger) {
     reshade::log::message(reshade::log::level::info, buf);
 }
 
-inline void poll_hotkeys(reshade::api::effect_runtime* rt) {
-    // Win32 VK_* values — defined as macros in winuser.h, use directly.
-    if (rt->is_key_pressed(VK_F2)) {
-        g_debug_mode.store((g_debug_mode.load() + 1) % 4, std::memory_order_relaxed);
-        log_tunables("F2 cycle debug");
+// ImGui overlay tab — Home → Add-ons → Neocron RenoDX Engine.
+void on_overlay(reshade::api::effect_runtime*) {
+    float amp   = g_bump_amp.load();
+    float lmin  = g_light_min.load();
+    float lmax  = g_light_max.load();
+    int   mode  = g_debug_mode.load();
+
+    ImGui::TextUnformatted("Per-texture normal mapping");
+    ImGui::Separator();
+
+    if (ImGui::SliderFloat("Bump amp",  &amp,  0.5f, 15.0f, "%.1f"))  g_bump_amp.store(amp);
+    if (ImGui::SliderFloat("Light min", &lmin, 0.0f,  1.0f, "%.2f"))  g_light_min.store(lmin);
+    if (ImGui::SliderFloat("Light max", &lmax, 1.0f,  3.0f, "%.2f"))  g_light_max.store(lmax);
+
+    static const char* MODES[] = {
+        "0 — Lit (full)",
+        "1 — Raw normal RGB",
+        "2 — NdotL grayscale",
+        "3 — Albedo only",
+    };
+    if (ImGui::Combo("Debug viz", &mode, MODES, IM_ARRAYSIZE(MODES))) g_debug_mode.store(mode);
+
+    if (ImGui::Button("Reset to defaults")) {
+        g_bump_amp.store(5.0f);
+        g_light_min.store(0.20f);
+        g_light_max.store(1.50f);
+        g_debug_mode.store(0);
+        log_tunables("ImGui reset");
     }
-    if (rt->is_key_pressed(VK_F3)) {
-        g_bump_amp.store(std::max(0.5f,  g_bump_amp.load() - 1.0f), std::memory_order_relaxed);
-        log_tunables("F3 amp -");
-    }
-    if (rt->is_key_pressed(VK_F4)) {
-        g_bump_amp.store(std::min(15.0f, g_bump_amp.load() + 1.0f), std::memory_order_relaxed);
-        log_tunables("F4 amp +");
-    }
-    if (rt->is_key_pressed(VK_F5)) {
-        g_light_min.store(std::min(0.95f, g_light_min.load() + 0.05f), std::memory_order_relaxed);
-        g_light_max.store(std::max(1.05f, g_light_max.load() - 0.05f), std::memory_order_relaxed);
-        log_tunables("F5 light narrow");
-    }
-    if (rt->is_key_pressed(VK_F6)) {
-        g_light_min.store(std::max(0.0f,  g_light_min.load() - 0.05f), std::memory_order_relaxed);
-        g_light_max.store(std::min(3.0f,  g_light_max.load() + 0.05f), std::memory_order_relaxed);
-        log_tunables("F6 light widen");
-    }
-    if (rt->is_key_pressed(VK_F11)) {
-        g_bump_amp.store(5.0f);   g_light_min.store(0.20f);
-        g_light_max.store(1.50f); g_debug_mode.store(0);
-        log_tunables("F11 reset");
-    }
+
+    ImGui::Separator();
+    ImGui::Text("Stats");
+    ImGui::Text("  world draws : %llu", (unsigned long long)g_world_draws.load());
+    ImGui::Text("  per-tex hits: %llu", (unsigned long long)g_world_draws_per_tex_hit.load());
+    ImGui::Text("  index hits  : %llu  misses: %llu",
+                (unsigned long long)g_index_hits.load(),
+                (unsigned long long)g_index_misses.load());
+    ImGui::Text("  lazy-loaded : %llu  cache: %zu",
+                (unsigned long long)g_lazy_loaded.load(),
+                g_normal_cache.size());
+    ImGui::Text("  index map   : %zu entries", g_hash_to_path.size());
 }
 
 void on_present(reshade::api::effect_runtime* rt) {
@@ -768,7 +785,6 @@ void on_present(reshade::api::effect_runtime* rt) {
         auto* dev = reinterpret_cast<IDirect3DDevice9*>(rt->get_device()->get_native());
         if (dev) load_default_normal(dev);
     }
-    if (rt) poll_hotkeys(rt);
     uint64_t f = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((f % 1800) == 0) {
         char buf[400];
@@ -811,14 +827,16 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::draw>(on_draw);
             reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
+            reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.4.3 (per-texture lookup + tunable HLSL + debug viz) registered");
+                "renodx-engine: m4 v0.4.4 (per-texture lookup + ImGui overlay tunables) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: hotkeys — F2=cycle debug viz (0=lit/1=raw normals/2=NdotL gray/3=albedo only), "
-                "F3/F4=bump amp -/+, F5/F6=light range narrow/widen, F11=reset");
+                "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
+                "'Neocron RenoDX Engine' for sliders + debug viz");
             break;
         case DLL_PROCESS_DETACH:
+            reshade::unregister_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::unregister_event<reshade::addon_event::reshade_present>(on_present);
             reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
             reshade::unregister_event<reshade::addon_event::draw>(on_draw);
