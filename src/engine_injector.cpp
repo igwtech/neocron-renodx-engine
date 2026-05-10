@@ -327,13 +327,16 @@ std::atomic<uint64_t> g_replacements_done{0};
 bool compile_one(const char* hlsl, const char* tag, std::vector<uint8_t>& out) {
     ID3DBlob* code = nullptr;
     ID3DBlob* errs = nullptr;
-    // v0.5.2: BACK TO ps_2_0. ps_3_0 broke game-state passthrough
-    // (lightmap, vcol, colorCorrection all read as 0). Game's VS + render
-    // state assumes ps_2_0 interpolant routing + constant tables.
-    // Cost: VPOS unavailable — view-dependent specular falls back to a
-    // fixed tangent-space (0,0,1) view direction.
+    // v0.5.3: ps_2_b instead of ps_2_0.
+    // ps_2_0 has a 64-instruction limit; our unified shader (vanilla
+    // formula + bump math + 11 debug-viz branches + scene-reactive
+    // gradient) compiles to 138 instructions which doesn't fit.
+    // ps_2_b is a profile extension of ps_2_0 with a 512-instruction
+    // ceiling, same VS-PS interpolant routing and constant-table
+    // semantics — so it doesn't reintroduce the v0.5.1 ps_3_0
+    // game-state-passthrough bug. DXVK / Polaris support trivially.
     HRESULT hr = g_D3DCompile(hlsl, std::strlen(hlsl), tag,
-        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &errs);
+        nullptr, nullptr, "main", "ps_2_b", 0, 0, &code, &errs);
     if (FAILED(hr) || !code) {
         char buf[400];
         std::snprintf(buf, sizeof(buf),
@@ -1084,7 +1087,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.5.2 (ps_2_0 — restores game lightmap/vcol/cc readability) registered");
+                "renodx-engine: m4 v0.5.3 (ps_2_b — fits 138-instr unified shader) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "

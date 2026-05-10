@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.3] — 2026-05-10
+
+Hotfix for v0.5.2: shader compile failed with X5608 — our unified
+HLSL produces 138 instructions but ps_2_0 caps at 64. Compile
+failure → empty replacement bytecode → substitution skipped → game
+ran vanilla (no bumps). Visible in v0.5.2 install: scene rendered
+correctly but no per-texture normal mapping at all.
+
+Fix: compile to **ps_2_b** instead. Same VS-PS interpolant routing
+and constant-table semantics as ps_2_0 (so the v0.5.1 ps_3_0
+game-state-passthrough bug doesn't return), but the instruction
+ceiling jumps to 512 — plenty of headroom for our debug viz, scene-
+reactive gradient, and bump math.
+
+DXVK / Polaris support ps_2_b trivially.
+
 ## [0.5.2] — 2026-05-10
 
 Compile back down to **ps_2_0**. v0.5.1's per-channel debug viz proved
