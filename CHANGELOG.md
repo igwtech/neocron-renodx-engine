@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.3.0] — 2026-05-10
+
+Tier 4 milestone 3 PoC — actual normal-mapped Phong replacement of
+`world.ps`. Architecturally complete; visual effect intentionally
+subtle pending m4 (per-texture lookup).
+
+### What's new
+- Loads a single AI-generated brick normal map at addon startup via
+  `stb_image` + raw D3D9 `CreateTexture` / `LockRect` (no d3dx
+  dependency, no PNG decoder built-in to Wine needed).
+- Hooks `addon_event::draw` / `draw_indexed` — when the substituted
+  world.ps is bound + Z-test enabled, calls `dev->SetTexture(5, normal)`
+  + sampler-state setup before each draw.
+- Replacement HLSL samples `samplerNormal : register(s5)` at tiled UVs,
+  decodes RGB → tangent normal, computes Lambertian against a hardcoded
+  sun direction, modulates `albedo × lightmap × 2`.
+
+### Diagnostic findings shipped as in-source comments
+- **Sampler index matters.** Initial attempt bound to `s2`; output
+  appeared as solid pink-white. Switched to `s5`. Suspected ReShade /
+  DXVK / game state-tracking using `s2` for something internal —
+  didn't fully diagnose; just moved off.
+- **ReShade post-processing masks the bump.** Toddyhancer tonemap
+  shifts blue-violet (typical normal map output) toward pink/white.
+  Toggle ReShade Effects OFF (default key) to see raw m3 output.
+- **Single normal for all surfaces is a known limitation.** This PoC
+  binds ONE brick normal map for every world.ps draw. Surfaces that
+  aren't brick (carpet, concrete, tile) get the brick pattern
+  inappropriately. m4 deals with this via per-texture lookup against
+  the AI-generated `_normal_pipeline/` corpus (~3000 sibling normals).
+
+### Build / deploy
+- `bin/neocron-renodx-engine.addon32` (~12 MB MinGW i686 cross-compiled,
+  static-linked, includes `stb_image.h` PNG decoder).
+- `assets/default_normal.png` is now part of the addon's `files`
+  (deployed as `~/Neocron2/neocron_default_normal.png`).
+- `expects:` keeps `d3d9.dll` + `d3dcompiler_47.dll` from
+  `neocron-renodx`; `requires:` chain unchanged.
+
 ## [0.2.0] — 2026-05-09
 
 Replacement HLSL extended with **luminance-bump fake normal mapping**.
