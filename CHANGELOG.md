@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.4.5] — 2026-05-10
+
+Two fixes for v0.4.4 user feedback.
+
+### Flat fallback (no more brick-on-everything)
+Previously when an albedo had no per-texture normal match, the engine
+bound the brick default normal to sampler 5 — every unmapped surface
+got the brick pattern. v0.4.5 sets a `BUMP_ON` flag (c21.w) to 0 in
+that case; the replacement HLSL skips sampler 5 entirely and outputs
+vanilla `albedo * lightmap * 2.0`. Result: surfaces with a per-tex
+hit get their AI normal; everything else looks exactly like vanilla.
+
+### mesh.ps replacement (NPCs, items, decals)
+The other game pixel shader, mesh.ps (CRC 0x96f566cb), is used by
+NPCs, characters, items, signs, decals, AND HUD overlays. v0.4.5
+substitutes mesh.ps with a parallel HLSL replacement that does the
+same per-texture normal lookup at sampler 5 — but only when the
+per-tex hash matches (HUD draws have Z-test off and game-side textures
+that aren't in the index, so they pass through vanilla automatically
+via the `BUMP_ON=0` path).
+
+Both shaders share the same `c20`/`c21` pixel-shader constants and
+the same ImGui overlay tab — no extra UI changes needed.
+
+### Coverage roadmap
+Stock corpus is still bricks-only. NPC / item normal generation needs
+extracting `models.pak` (or pulling from `nc2-hd-textures/gfx/modeltextures/`
+which is already 506 entries via the HD index when that addon is
+installed).
+
 ## [0.4.4] — 2026-05-10
 
 Switched from F2-F6/F11 hotkeys to ImGui sliders in the ReShade overlay.

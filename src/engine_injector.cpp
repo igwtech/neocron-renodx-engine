@@ -96,32 +96,31 @@ std::atomic<int>   g_debug_mode{0};
 // Sun direction is fixed for now (no F-key tweak yet); kept in defaults.
 constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
 
-// m4 v0.4.3 — runtime-tunable normal mapping with debug viz modes.
+// m4 v0.4.5 — pixel-shader constants used by BOTH world.ps and mesh.ps
+// replacements. Game uses c0..c7, so we go to c20+ to avoid collision.
+//   c20.x = BUMP_AMP    (XY tilt amplification, 0.5..15)
+//   c20.y = LIGHT_MIN   (light value at NdotL=0, default 0.2)
+//   c20.z = LIGHT_MAX   (light value at NdotL=1, default 1.5)
+//   c20.w = DEBUG_MODE  (0=lit, 1=raw normal RGB, 2=NdotL gray, 3=albedo only)
+//   c21.xyz = SUN_TS    (tangent-space sun, normalised)
+//   c21.w = BUMP_ON     (1 = use per-tex normal; 0 = pass-through vanilla)
 //
-// Pixel shader constants we use (game's world.ps uses c0..c7 for its own
-// stuff like colorCorrection, so we go to c20+ for safety):
-//   c20.x = BUMP_AMP        (XY tilt amplification, 0.5..15)
-//   c20.y = LIGHT_MIN       (light value at NdotL=0, default 0.2)
-//   c20.z = LIGHT_MAX       (light value at NdotL=1, default 1.5)
-//   c20.w = DEBUG_MODE      (0=normal, 1=raw normal RGB, 2=NdotL gray, 3=albedo only)
-//   c21.xyz = SUN_TS        (sun direction in tangent space, normalised)
-//
-// Hotkeys (handled in on_present via effect_runtime::is_key_pressed):
-//   F2 = cycle debug mode
-//   F3 = bump amp -1   F4 = bump amp +1
-//   F5 = light range narrower   F6 = wider
-//   F11 = reset to defaults
+// world.ps replacement (lit world geometry, lightmap-sampled).
 const char* WORLD_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);
 sampler2D samplerLightmap : register(s1);
 sampler2D samplerNormal   : register(s5);
 
-float4 g_params : register(c20);  // x=bump_amp y=light_min z=light_max w=debug_mode
-float4 g_sun    : register(c21);  // xyz=tangent-space sun
+float4 g_params : register(c20);
+float4 g_sun    : register(c21);
 
 float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1, float4 vcol : COLOR0) : COLOR {
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
+    float4 vanilla  = saturate(albedo * lightmap * 2.0);
+
+    // BUMP_ON=0 → skip the per-tex normal entirely, output vanilla colour.
+    if (g_sun.w < 0.5) return vanilla;
 
     float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
     float3 n_ts  = float3(n_raw.xy * g_params.x, n_raw.z);
@@ -129,13 +128,46 @@ float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1, float4 vcol : COLOR
 
     float NdotL = saturate(dot(n_ts, g_sun.xyz));
     float light = lerp(g_params.y, g_params.z, NdotL);
-    float4 lit  = saturate(albedo * lightmap * 2.0 * light);
+    float4 lit  = saturate(vanilla * light);
 
-    // Debug modes — branch is on a uniform (w), free in ps_2_0 static branching
     float mode = g_params.w;
-    if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0); // raw normal
-    if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);          // NdotL grayscale
-    if (mode > 2.5)                return albedo;                          // albedo only
+    if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0);
+    if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);
+    if (mode > 2.5)                return albedo;
+    return lit;
+}
+)hlsl";
+
+// mesh.ps replacement (CRC 0x96f566cb) — generic textured PS used by
+// NPCs, characters, items, decals, signs, AND HUD overlays. We bind
+// normals only when t_z_enabled (3D world geometry); HUD draws have
+// Z-test off, so the binding skips and these draws use vanilla output.
+constexpr uint32_t MESH_PS_CRC = 0x96f566cbu;
+const char* MESH_PS_HLSL = R"hlsl(
+sampler2D samplerAlbedo : register(s0);
+sampler2D samplerNormal : register(s5);
+
+float4 g_params : register(c20);
+float4 g_sun    : register(c21);
+
+float4 main(float2 uv : TEXCOORD0, float4 vcol : COLOR0) : COLOR {
+    float4 albedo  = tex2D(samplerAlbedo, uv);
+    float4 vanilla = albedo * vcol;
+
+    if (g_sun.w < 0.5) return vanilla;
+
+    float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
+    float3 n_ts  = float3(n_raw.xy * g_params.x, n_raw.z);
+    n_ts = normalize(n_ts);
+
+    float NdotL = saturate(dot(n_ts, g_sun.xyz));
+    float light = lerp(g_params.y, g_params.z, NdotL);
+    float4 lit  = saturate(vanilla * light);
+
+    float mode = g_params.w;
+    if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0);
+    if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);
+    if (mode > 2.5)                return albedo;
     return lit;
 }
 )hlsl";
@@ -158,8 +190,36 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(
 
 HMODULE        g_d3dc        = nullptr;
 PFN_D3DCompile g_D3DCompile  = nullptr;
-std::vector<uint8_t> g_replacement_bytecode;
+std::vector<uint8_t> g_world_ps_bytecode;
+std::vector<uint8_t> g_mesh_ps_bytecode;
 std::atomic<uint64_t> g_replacements_done{0};
+
+bool compile_one(const char* hlsl, const char* tag, std::vector<uint8_t>& out) {
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errs = nullptr;
+    HRESULT hr = g_D3DCompile(hlsl, std::strlen(hlsl), tag,
+        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &errs);
+    if (FAILED(hr) || !code) {
+        char buf[400];
+        std::snprintf(buf, sizeof(buf),
+            "renodx-engine: D3DCompile FAILED for %s hr=0x%08x errs=%s",
+            tag, (unsigned)hr,
+            errs ? (const char*)errs->GetBufferPointer() : "(none)");
+        reshade::log::message(reshade::log::level::error, buf);
+        if (errs) errs->Release();
+        return false;
+    }
+    out.assign(
+        (const uint8_t*)code->GetBufferPointer(),
+        (const uint8_t*)code->GetBufferPointer() + code->GetBufferSize());
+    code->Release();
+    if (errs) errs->Release();
+    char buf[200];
+    std::snprintf(buf, sizeof(buf),
+        "renodx-engine: replacement %s compiled, %zu bytes ps_2_0", tag, out.size());
+    reshade::log::message(reshade::log::level::info, buf);
+    return true;
+}
 
 bool compile_replacement() {
     g_d3dc = LoadLibraryA("d3dcompiler_47.dll");
@@ -170,33 +230,9 @@ bool compile_replacement() {
     }
     g_D3DCompile = (PFN_D3DCompile)GetProcAddress(g_d3dc, "D3DCompile");
     if (!g_D3DCompile) return false;
-
-    ID3DBlob* code = nullptr;
-    ID3DBlob* errs = nullptr;
-    HRESULT hr = g_D3DCompile(WORLD_PS_HLSL, std::strlen(WORLD_PS_HLSL),
-        "world_ps_replacement.hlsl",
-        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &errs);
-    if (FAILED(hr) || !code) {
-        char buf[400];
-        std::snprintf(buf, sizeof(buf),
-            "renodx-engine: D3DCompile FAILED hr=0x%08x errs=%s",
-            (unsigned)hr, errs ? (const char*)errs->GetBufferPointer() : "(none)");
-        reshade::log::message(reshade::log::level::error, buf);
-        if (errs) errs->Release();
-        return false;
-    }
-    g_replacement_bytecode.assign(
-        (const uint8_t*)code->GetBufferPointer(),
-        (const uint8_t*)code->GetBufferPointer() + code->GetBufferSize());
-    code->Release();
-    if (errs) errs->Release();
-
-    char buf[160];
-    std::snprintf(buf, sizeof(buf),
-        "renodx-engine: replacement world.ps compiled, %zu bytes ps_2_0 (m3 v0.3 normal-mapped Phong)",
-        g_replacement_bytecode.size());
-    reshade::log::message(reshade::log::level::info, buf);
-    return true;
+    bool ok_w = compile_one(WORLD_PS_HLSL, "world.ps", g_world_ps_bytecode);
+    bool ok_m = compile_one(MESH_PS_HLSL,  "mesh.ps",  g_mesh_ps_bytecode);
+    return ok_w && ok_m;
 }
 
 // ── default normal map (loaded once at first present) ────────────────
@@ -471,7 +507,7 @@ bool on_create_pipeline(reshade::api::device*,
                         reshade::api::pipeline_layout,
                         uint32_t subobject_count,
                         const reshade::api::pipeline_subobject* subobjects) {
-    if (g_replacement_bytecode.empty()) return false;
+    if (g_world_ps_bytecode.empty() && g_mesh_ps_bytecode.empty()) return false;
     bool modified = false;
     for (uint32_t i = 0; i < subobject_count; ++i) {
         const auto& s = subobjects[i];
@@ -479,17 +515,25 @@ bool on_create_pipeline(reshade::api::device*,
         auto* desc = static_cast<reshade::api::shader_desc*>(s.data);
         if (!desc || !desc->code || !desc->code_size) continue;
         uint32_t c = crc32(static_cast<const uint8_t*>(desc->code), desc->code_size);
-        if (c == WORLD_PS_CRC) {
-            desc->code      = g_replacement_bytecode.data();
-            desc->code_size = g_replacement_bytecode.size();
-            modified = true;
-            uint64_t n = g_replacements_done.fetch_add(1, std::memory_order_relaxed) + 1;
-            char buf[120];
-            std::snprintf(buf, sizeof(buf),
-                "renodx-engine: world.ps create_pipeline #%llu — substituted (%zu bytes)",
-                (unsigned long long)n, g_replacement_bytecode.size());
-            reshade::log::message(reshade::log::level::info, buf);
+
+        const std::vector<uint8_t>* repl = nullptr;
+        const char* tag = nullptr;
+        if (c == WORLD_PS_CRC && !g_world_ps_bytecode.empty()) {
+            repl = &g_world_ps_bytecode; tag = "world.ps";
+        } else if (c == MESH_PS_CRC && !g_mesh_ps_bytecode.empty()) {
+            repl = &g_mesh_ps_bytecode;  tag = "mesh.ps";
         }
+        if (!repl) continue;
+
+        desc->code      = repl->data();
+        desc->code_size = repl->size();
+        modified = true;
+        uint64_t n = g_replacements_done.fetch_add(1, std::memory_order_relaxed) + 1;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+            "renodx-engine: %s create_pipeline #%llu — substituted (%zu bytes)",
+            tag, (unsigned long long)n, repl->size());
+        reshade::log::message(reshade::log::level::info, buf);
     }
     return modified;
 }
@@ -514,14 +558,18 @@ void on_init_pipeline(reshade::api::device*,
         uint32_t c = crc32(static_cast<const uint8_t*>(desc->code), desc->code_size);
         std::lock_guard<std::mutex> g(g_pipe_mu);
         g_ps_pipeline_to_crc[pipeline.handle] = c;
-        // Did we just substitute this one? Mark by checking if the bytecode
-        // matches our compiled replacement (same pointer + size).
-        if (!g_replacement_bytecode.empty() &&
-            desc->code == g_replacement_bytecode.data() &&
-            desc->code_size == g_replacement_bytecode.size()) {
+        // Mark substituted pipelines so bind_pipeline can flag them for
+        // bind_normal_for_draw. We compare to either replacement bytecode.
+        if ((!g_world_ps_bytecode.empty() &&
+             desc->code == g_world_ps_bytecode.data() &&
+             desc->code_size == g_world_ps_bytecode.size()) ||
+            (!g_mesh_ps_bytecode.empty() &&
+             desc->code == g_mesh_ps_bytecode.data() &&
+             desc->code_size == g_mesh_ps_bytecode.size())) {
             g_substituted_ps_pipelines.insert(pipeline.handle);
         }
-        if (g_dumped_ps.insert(c).second && c != WORLD_PS_CRC)
+        if (g_dumped_ps.insert(c).second &&
+            c != WORLD_PS_CRC && c != MESH_PS_CRC)
             dump_ps_bytecode(c, desc->code, desc->code_size);
     }
 }
@@ -681,17 +729,18 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         albedo->Release();
     }
 
+    // Per-tex hit means real bump path. Otherwise the shader sees BUMP_ON=0
+    // and bypasses sampler 5 entirely, returning vanilla albedo*lightmap*2.
     bool per_tex = normal != nullptr;
-    if (!normal) normal = g_default_normal;
-    if (!normal) return;   // nothing to bind, leave shader sampling whatever's there
+    if (per_tex) {
+        dev->SetTexture(NORMAL_SAMPLER, normal);
+        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSU,  D3DTADDRESS_WRAP);
+        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSV,  D3DTADDRESS_WRAP);
+        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    }
 
-    dev->SetTexture(NORMAL_SAMPLER, normal);
-    dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSU,  D3DTADDRESS_WRAP);
-    dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSV,  D3DTADDRESS_WRAP);
-    dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-    dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-
-    // Push tunables to pixel-shader constants. Cheap (4 floats per draw).
+    // Push tunables to pixel-shader constants. Cheap (8 floats per draw).
     float params[4] = {
         g_bump_amp.load(std::memory_order_relaxed),
         g_light_min.load(std::memory_order_relaxed),
@@ -699,7 +748,7 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         (float)g_debug_mode.load(std::memory_order_relaxed)
     };
     dev->SetPixelShaderConstantF(PARAMS_PS_REG, params, 1);
-    float sun[4] = { SUN_X, SUN_Y, SUN_Z, 0.0f };
+    float sun[4] = { SUN_X, SUN_Y, SUN_Z, per_tex ? 1.0f : 0.0f };
     dev->SetPixelShaderConstantF(SUN_PS_REG, sun, 1);
 
     g_world_draws.fetch_add(1, std::memory_order_relaxed);
@@ -829,7 +878,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.4.4 (per-texture lookup + ImGui overlay tunables) registered");
+                "renodx-engine: m4 v0.4.5 (world.ps + mesh.ps; flat fallback; ImGui overlay) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
