@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.4] — 2026-05-10
+
+Diagnostic-only release. v0.5.3's switch to ps_2_b *did* let the
+shader actually compile, but the `lightmap` and `colorCorrection`
+inputs are STILL coming through as zero — so the bug isn't the
+shader profile after all.
+
+The two remaining hypotheses are:
+1. **Sampler 1 isn't actually bound** for the draws we substitute.
+2. **TEXCOORD1 (uv_lm) interpolant** is reaching us as `(0, 0)` so
+   we're sampling the lightmap at its corner texel.
+
+Added 4 new debug viz modes that discriminate between the two:
+- **11 — Lightmap @ fixed UV(0.5,0.5)** — bypasses uv_lm. If still
+  black → sampler 1 not bound. If non-zero → it's the interpolant.
+- **12 — Lightmap sampled with TEXCOORD0** — uses the (working) UV
+  channel from albedo to look up the lightmap.
+- **13 — TEXCOORD1 raw** — outputs uv_lm.x as red, uv_lm.y as green.
+  If varying gradient → interpolant is fine. If solid colour →
+  interpolant is dead.
+- **14 — TEXCOORD0 raw** — control gradient (we know this works
+  because debug mode 5 / albedo channel renders correctly).
+
+Other diagnostic improvement:
+- Mode 8 now outputs `colorCorrection.xyz` as full RGB instead of
+  just `.x` so we can see if it's literally `(0,0,0)` or
+  `(small, small, small)`.
+
 ## [0.5.3] — 2026-05-10
 
 Hotfix for v0.5.2: shader compile failed with X5608 — our unified

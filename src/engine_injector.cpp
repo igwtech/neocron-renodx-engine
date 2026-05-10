@@ -247,9 +247,19 @@ float4 main(float2 uv     : TEXCOORD0,
     if (dmode > 4.5 && dmode < 5.5) return float4(albedo.rgb, 1.0);              // 5 = albedo channel
     if (dmode > 5.5 && dmode < 6.5) return float4(lightmap.rgb, 1.0);            // 6 = lightmap channel
     if (dmode > 6.5 && dmode < 7.5) return float4(vcol.rgb, 1.0);                // 7 = vcol channel
-    if (dmode > 7.5 && dmode < 8.5) return float4(colorCorrection.xxx, 1.0);     // 8 = cc.x as gray
+    if (dmode > 7.5 && dmode < 8.5) return float4(colorCorrection.xyz, 1.0);     // 8 = cc.xyz as RGB
     if (dmode > 8.5 && dmode < 9.5) return float4(vcol_eff, 1.0);                // 9 = vcol after mix
-    if (dmode > 9.5)                return float4(lm,       1.0);                // 10 = lm after mix
+    if (dmode > 9.5 && dmode < 10.5) return float4(lm, 1.0);                     // 10 = lm after mix
+    // v0.5.4 diagnostic: discriminate sampler-binding vs interpolant problems
+    if (dmode > 10.5 && dmode < 11.5)
+        return float4(tex2D(samplerLightmap, float2(0.5, 0.5)).rgb, 1.0);        // 11 = lm at fixed UV (0.5,0.5)
+    if (dmode > 11.5 && dmode < 12.5)
+        return float4(tex2D(samplerLightmap, uv).rgb, 1.0);                       // 12 = lm sampled with TEXCOORD0 instead of TEXCOORD1
+    if (dmode > 12.5 && dmode < 13.5) {                                           // 13 = TEXCOORD1 raw (uv_lm as gradient)
+        return float4(uv_lm, 0.0, 1.0);
+    }
+    if (dmode > 13.5)                                                             // 14 = TEXCOORD0 raw for comparison
+        return float4(uv, 0.0, 1.0);
 
     if (g_sun.w < 0.5) return float4(vanilla_rgb, vanilla_a);
 
@@ -952,9 +962,13 @@ void on_overlay(reshade::api::effect_runtime*) {
         "5 — Albedo channel",
         "6 — Lightmap channel",
         "7 — vcol channel",
-        "8 — colorCorrection.x grayscale",
+        "8 — colorCorrection.xyz",
         "9 — vcol after mix slider",
         "10 — Lightmap after mix slider",
+        "11 — Lightmap @ fixed UV(0.5,0.5)",
+        "12 — Lightmap sampled with TEXCOORD0",
+        "13 — TEXCOORD1 raw (uv_lm gradient)",
+        "14 — TEXCOORD0 raw (uv gradient)",
     };
     if (ImGui::Combo("Debug viz", &mode, MODES, IM_ARRAYSIZE(MODES))) g_debug_mode.store(mode);
 
@@ -1087,7 +1101,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.5.3 (ps_2_b — fits 138-instr unified shader) registered");
+                "renodx-engine: m4 v0.5.4 (debug modes 11-14 to discriminate sampler vs interpolant) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
