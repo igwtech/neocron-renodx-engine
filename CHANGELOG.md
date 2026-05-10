@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.9] — 2026-05-10
+
+Hotfix for v0.4.8: black screen at login menu. The unified replacement
+read `vcol` from `TEXCOORD2` (matching the disassembled game shader's
+`dcl t2`), but on Wine/DXVK an interpolant unwritten by the VS reads as
+`(0,0,0,0)` instead of D3D9 reference's `(1,1,1,1)`. The game's `world.vs`
+writes its diffuse to `oD0` (COLOR0), not `oT2` — so for world / menu
+draws our shader was multiplying everything by zero → black.
+
+### Defensive fallbacks
+- `vcol` now reads from BOTH `TEXCOORD2` AND `COLOR0`, picks whichever
+  is non-zero (defaults to `(1,1,1,1)`).
+- `colorCorrection` falls back to `1.0` when `c4.x` is zero.
+- `lightmap` falls back to `(1,1,1)` when the bound sampler is all-zero.
+
+These defensive defaults match what D3D9 reference behaviour appears to
+provide on Windows when interpolants / constants are unset.
+
 ## [0.4.8] — 2026-05-10
 
 Reverse-engineered the game's exact pixel-shader formula via

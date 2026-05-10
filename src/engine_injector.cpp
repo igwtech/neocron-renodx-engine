@@ -194,15 +194,32 @@ float4 g_extra3 : register(c24);
 
 float luminance(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 
-float4 main(float2 uv    : TEXCOORD0,
-            float2 uv_lm : TEXCOORD1,
-            float4 vcol  : TEXCOORD2,        // CRITICAL: game uses TEXCOORD2
-            float2 vpos  : VPOS) : COLOR {
+float4 main(float2 uv     : TEXCOORD0,
+            float2 uv_lm  : TEXCOORD1,
+            float4 vcol_t : TEXCOORD2,       // skinned mesh / HUD uses this
+            float4 vcol_c : COLOR0,          // world.vs uses this (oD0)
+            float2 vpos   : VPOS) : COLOR {
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
 
+    // The game's bytecode always reads from t2 — but on Wine/DXVK an
+    // interpolant unwritten by the VS reads as (0,0,0,0) instead of
+    // D3D9's reference default (1,1,1,1). World.vs writes oD0 (COLOR0),
+    // mesh/HUD VS writes oT2. Pick whichever is non-zero, default to 1.
+    float t2_active = saturate(dot(vcol_t, float4(1,1,1,1)));
+    float c0_active = saturate(dot(vcol_c, float4(1,1,1,1)));
+    float4 vcol = (t2_active > 0.001) ? vcol_t :
+                  (c0_active > 0.001) ? vcol_c : float4(1,1,1,1);
+
+    // Same defensive defaults for game constants that may be 0 on draws
+    // where the game didn't set them this frame (HUD has no lightmap; menu
+    // may not set colorCorrection).
+    float cc = (colorCorrection.x > 0.001) ? colorCorrection.x : 1.0;
+    float lm_present = saturate(lightmap.r + lightmap.g + lightmap.b);
+    float3 lm = (lm_present > 0.001) ? lightmap.rgb : float3(1,1,1);
+
     // EXACT vanilla NC2 formula — matches all 4 disassembled game PS
-    float3 vanilla_rgb = albedo.rgb * vcol.rgb * lightmap.rgb * colorCorrection.x;
+    float3 vanilla_rgb = albedo.rgb * vcol.rgb * lm * cc;
     float  vanilla_a   = albedo.a   * vcol.a;
 
     if (g_sun.w < 0.5) return float4(vanilla_rgb, vanilla_a);
