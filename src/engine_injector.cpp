@@ -37,29 +37,41 @@ constexpr uint32_t WORLD_PS_CRC = 0x2ccf5eb7u;
 // First replacement is intentionally "loud" so we can confirm the hook
 // works visually. Iterate this string in subsequent milestones to add
 // real normal-mapped lighting.
-// v0.1 baseline replacement: faithful albedo × lightmap × 2 to match the
-// vanilla world.ps output. World.vs outputs (decoded from bytecode of CRC
-// 0x5925dce1):
-//   oPos = local_to_screen_matrix * vertexPos     (clip-space position)
-//   oFog = saturate((fog_end - distance) / (fog_end - fog_start))
-//   oD0  = vertex diffuse colour
-//   oT0  = TEXCOORD0 = albedo UV
-//   oT1  = TEXCOORD1 = lightmap UV
-// Vanilla world.ps multiplies albedo*lightmap*2 (def constant c1=(2,2,2,1)
-// suggests 2x brighten compensation). We replicate that here. Subtle green
-// push marker (1.05x g) lets us confirm the shader is ours. Real normal-
-// mapped lighting comes in milestone 3 (per-texture normal sampling via
-// SetTexture interception with the AI-generated _n.png corpus).
+// v0.2 — luminance-bump fake normal mapping. Derives a pseudo-tangent
+// normal from the albedo's luminance gradient (small offsets in U/V),
+// dots it against a hardcoded sun direction, modulates the
+// vanilla-equivalent albedo*lightmap*2 base. No external normal-map
+// texture needed — every wall/floor surface gets bump-style highlights
+// in proportion to its texture's high-contrast detail (panel seams,
+// brick grout, carpet weave). ps_2_0-friendly (~14 instructions).
+//
+// Per-texture AI-generated normal-map sampling is m3 — needs SetTexture
+// interception + sibling lookup against the _normal_pipeline/ corpus,
+// real engineering work for the next session.
 const char* WORLD_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);
 sampler2D samplerLightmap : register(s1);
 
+static const float3 LUMA = float3(0.299, 0.587, 0.114);
+static const float3 SUN_TS = float3(0.408, 0.408, 0.816);   // pre-normalised
+static const float  STEP = 0.005;     // UV offset for gradient (~half a 256² texel)
+static const float  BUMP = 3.0;       // gradient → normal slope multiplier
+
 float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1, float4 vcol : COLOR0) : COLOR {
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
-    float4 lit      = albedo * lightmap * 2.0;
-    lit.g *= 1.05;   // subtle marker: very slight green push, proves we're active
-    return saturate(lit);
+
+    // Pseudo-normal from albedo luminance gradient
+    float lc = dot(albedo.rgb,                                     LUMA);
+    float lr = dot(tex2D(samplerAlbedo, uv + float2(STEP, 0)).rgb, LUMA);
+    float lu = dot(tex2D(samplerAlbedo, uv + float2(0, STEP)).rgb, LUMA);
+    float3 n  = normalize(float3((lc - lr) * BUMP, (lc - lu) * BUMP, 1.0));
+
+    // Lambertian against fixed sun, lifted by ambient floor
+    float NdotL = saturate(dot(n, SUN_TS));
+    float light = 0.65 + 0.35 * NdotL;
+
+    return saturate(albedo * lightmap * 2.0 * light);
 }
 )hlsl";
 

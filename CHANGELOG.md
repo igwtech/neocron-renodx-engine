@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.2.0] — 2026-05-09
+
+Replacement HLSL extended with **luminance-bump fake normal mapping**.
+Self-contained — does not depend on the per-texture AI normal map
+corpus (that's m3 next session).
+
+How it works:
+
+```
+albedo  = sample(samplerAlbedo, uv)
+luma_c  = luminance(albedo.rgb)
+luma_r  = luminance(sample(samplerAlbedo, uv + (0.005, 0)))   // small U offset
+luma_u  = luminance(sample(samplerAlbedo, uv + (0, 0.005)))   // small V offset
+
+n_ts    = normalise( (luma_c - luma_r) * 3,
+                     (luma_c - luma_u) * 3,
+                     1.0 )                                    // pseudo-normal
+
+NdotL   = saturate(dot(n_ts, SUN_TS))                         // hardcoded sun
+light   = 0.65 + 0.35 * NdotL                                 // ambient + diffuse
+
+return albedo * lightmap * 2 * light
+```
+
+Effect: surfaces with high-contrast albedo texture (panel seams, brick
+grout, carpet weave, scuff marks) get visible bump-style highlights
+and shadows in the direction of a hardcoded sun. Flat surfaces stay
+roughly vanilla.
+
+ps_2_0 instruction count: ~14 (well under the 64 limit). Performance
+hit: 2 extra texture taps per world pixel (~5% on Polaris).
+
 ## [0.1.1] — 2026-05-09
 
 Launcher distribution polish — no functional changes.
