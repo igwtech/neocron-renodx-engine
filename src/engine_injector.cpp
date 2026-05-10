@@ -70,30 +70,68 @@ constexpr const char* STOCK_CORPUS_DIR  = "gfx_normals_stock\\";
 constexpr size_t HASH_SAMPLE_BYTES = 4096;  // must match build-hash-index.py
 constexpr size_t NORMAL_CACHE_MAX  = 256;   // cap LRU; ~50 MB for typical 256² normals
 
-// m4 v0.4 — per-texture normals at sampler 5. UV is used 1:1 (no tiling)
-// because each bound normal matches its albedo's UV layout. Fallback brick
-// when no per-texture match: still 1:1, will look low-res on large surfaces
-// but correct topologically.
+// Pixel-shader constant register for our params — picked to NOT collide with
+// game's world.ps which uses c0..c7 for color correction etc.
+constexpr UINT  PARAMS_PS_REG = 20;   // c20 = bump_amp, light_min, light_max, debug_mode
+constexpr UINT  SUN_PS_REG    = 21;   // c21 = sun direction (tangent space)
+
+// Tunables (default values; hotkeys mutate at runtime)
+struct Tunables {
+    float bump_amp   = 5.0f;   // F3-/F4+
+    float light_min  = 0.20f;  // F5/F6 narrows / widens
+    float light_max  = 1.50f;
+    float debug_mode = 0.0f;   // F2 cycles 0..3
+    float sun_x      = 0.408f, sun_y = 0.408f, sun_z = 0.816f;  // pre-normalised
+    void reset() { *this = Tunables{}; }
+};
+std::atomic<float> g_bump_amp{5.0f};
+std::atomic<float> g_light_min{0.20f};
+std::atomic<float> g_light_max{1.50f};
+std::atomic<int>   g_debug_mode{0};
+// Sun direction is fixed for now (no F-key tweak yet); kept in defaults.
+constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
+
+// m4 v0.4.3 — runtime-tunable normal mapping with debug viz modes.
+//
+// Pixel shader constants we use (game's world.ps uses c0..c7 for its own
+// stuff like colorCorrection, so we go to c20+ for safety):
+//   c20.x = BUMP_AMP        (XY tilt amplification, 0.5..15)
+//   c20.y = LIGHT_MIN       (light value at NdotL=0, default 0.2)
+//   c20.z = LIGHT_MAX       (light value at NdotL=1, default 1.5)
+//   c20.w = DEBUG_MODE      (0=normal, 1=raw normal RGB, 2=NdotL gray, 3=albedo only)
+//   c21.xyz = SUN_TS        (sun direction in tangent space, normalised)
+//
+// Hotkeys (handled in on_present via effect_runtime::is_key_pressed):
+//   F2 = cycle debug mode
+//   F3 = bump amp -1   F4 = bump amp +1
+//   F5 = light range narrower   F6 = wider
+//   F11 = reset to defaults
 const char* WORLD_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);
 sampler2D samplerLightmap : register(s1);
 sampler2D samplerNormal   : register(s5);
 
-static const float3 SUN_TS = float3(0.408, 0.408, 0.816);   // pre-normalised
+float4 g_params : register(c20);  // x=bump_amp y=light_min z=light_max w=debug_mode
+float4 g_sun    : register(c21);  // xyz=tangent-space sun
 
 float4 main(float2 uv : TEXCOORD0, float2 uv_lm : TEXCOORD1, float4 vcol : COLOR0) : COLOR {
     float4 albedo   = tex2D(samplerAlbedo,   uv);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
 
-    // Sample per-texture normal, decode RGB[0,1] → tangent normal[-1,1]
-    float3 n_ts = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
+    float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
+    float3 n_ts  = float3(n_raw.xy * g_params.x, n_raw.z);
     n_ts = normalize(n_ts);
 
-    // Lambertian against fixed sun
-    float NdotL = saturate(dot(n_ts, SUN_TS));
-    float light = 0.40 + 0.60 * NdotL;
+    float NdotL = saturate(dot(n_ts, g_sun.xyz));
+    float light = lerp(g_params.y, g_params.z, NdotL);
+    float4 lit  = saturate(albedo * lightmap * 2.0 * light);
 
-    return saturate(albedo * lightmap * 2.0 * light);
+    // Debug modes — branch is on a uniform (w), free in ps_2_0 static branching
+    float mode = g_params.w;
+    if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0); // raw normal
+    if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);          // NdotL grayscale
+    if (mode > 2.5)                return albedo;                          // albedo only
+    return lit;
 }
 )hlsl";
 
@@ -648,6 +686,17 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
     dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
 
+    // Push tunables to pixel-shader constants. Cheap (4 floats per draw).
+    float params[4] = {
+        g_bump_amp.load(std::memory_order_relaxed),
+        g_light_min.load(std::memory_order_relaxed),
+        g_light_max.load(std::memory_order_relaxed),
+        (float)g_debug_mode.load(std::memory_order_relaxed)
+    };
+    dev->SetPixelShaderConstantF(PARAMS_PS_REG, params, 1);
+    float sun[4] = { SUN_X, SUN_Y, SUN_Z, 0.0f };
+    dev->SetPixelShaderConstantF(SUN_PS_REG, sun, 1);
+
     g_world_draws.fetch_add(1, std::memory_order_relaxed);
     if (per_tex) {
         uint64_t n = g_world_draws_per_tex_hit.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -672,12 +721,54 @@ bool on_draw_indexed(reshade::api::command_list* cmd, uint32_t, uint32_t, uint32
 
 std::atomic<uint64_t> g_frame{0};
 
+void log_tunables(const char* trigger) {
+    char buf[200];
+    std::snprintf(buf, sizeof(buf),
+        "renodx-engine: tunables [%s] amp=%.1f light=[%.2f..%.2f] debug=%d",
+        trigger,
+        g_bump_amp.load(), g_light_min.load(), g_light_max.load(),
+        g_debug_mode.load());
+    reshade::log::message(reshade::log::level::info, buf);
+}
+
+inline void poll_hotkeys(reshade::api::effect_runtime* rt) {
+    // Win32 VK_* values — defined as macros in winuser.h, use directly.
+    if (rt->is_key_pressed(VK_F2)) {
+        g_debug_mode.store((g_debug_mode.load() + 1) % 4, std::memory_order_relaxed);
+        log_tunables("F2 cycle debug");
+    }
+    if (rt->is_key_pressed(VK_F3)) {
+        g_bump_amp.store(std::max(0.5f,  g_bump_amp.load() - 1.0f), std::memory_order_relaxed);
+        log_tunables("F3 amp -");
+    }
+    if (rt->is_key_pressed(VK_F4)) {
+        g_bump_amp.store(std::min(15.0f, g_bump_amp.load() + 1.0f), std::memory_order_relaxed);
+        log_tunables("F4 amp +");
+    }
+    if (rt->is_key_pressed(VK_F5)) {
+        g_light_min.store(std::min(0.95f, g_light_min.load() + 0.05f), std::memory_order_relaxed);
+        g_light_max.store(std::max(1.05f, g_light_max.load() - 0.05f), std::memory_order_relaxed);
+        log_tunables("F5 light narrow");
+    }
+    if (rt->is_key_pressed(VK_F6)) {
+        g_light_min.store(std::max(0.0f,  g_light_min.load() - 0.05f), std::memory_order_relaxed);
+        g_light_max.store(std::min(3.0f,  g_light_max.load() + 0.05f), std::memory_order_relaxed);
+        log_tunables("F6 light widen");
+    }
+    if (rt->is_key_pressed(VK_F11)) {
+        g_bump_amp.store(5.0f);   g_light_min.store(0.20f);
+        g_light_max.store(1.50f); g_debug_mode.store(0);
+        log_tunables("F11 reset");
+    }
+}
+
 void on_present(reshade::api::effect_runtime* rt) {
     // Lazy-load normal on the first frame after the device is fully up.
     if (!g_default_normal && rt) {
         auto* dev = reinterpret_cast<IDirect3DDevice9*>(rt->get_device()->get_native());
         if (dev) load_default_normal(dev);
     }
+    if (rt) poll_hotkeys(rt);
     uint64_t f = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((f % 1800) == 0) {
         char buf[400];
@@ -721,7 +812,11 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.4 (per-texture lookup via on-bind LockRect) registered");
+                "renodx-engine: m4 v0.4.3 (per-texture lookup + tunable HLSL + debug viz) registered");
+            log_tunables("init defaults");
+            reshade::log::message(reshade::log::level::info,
+                "renodx-engine: hotkeys — F2=cycle debug viz (0=lit/1=raw normals/2=NdotL gray/3=albedo only), "
+                "F3/F4=bump amp -/+, F5/F6=light range narrow/widen, F11=reset");
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_event<reshade::addon_event::reshade_present>(on_present);

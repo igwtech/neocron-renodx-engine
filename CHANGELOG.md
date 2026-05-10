@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.4.3] — 2026-05-10
+
+Runtime-tunable HLSL params + debug viz modes via in-game hotkeys.
+DeepBump's normal output for low-contrast albedos has small XY tilt
+(stddev ~7-16 / 255 for vanilla bricks), which a straight Lambertian
+masks against the lightmap. v0.4.3 amplifies the XY tilt 5× by
+default and exposes the amp + light range as runtime knobs so users
+can tune by surface category.
+
+### HLSL changes
+- `n_ts.xy *= bump_amp;` before normalise (default amp = 5).
+- Light range `lerp(min, max, NdotL)` instead of `0.4 + 0.6*NdotL`
+  (default 0.20 .. 1.50 — wider contrast).
+- 4 debug viz modes selectable via shader uniform: lit / raw normal /
+  NdotL grayscale / albedo only.
+
+### New pixel-shader constants (registers c20, c21)
+- `c20.xyzw` = `(bump_amp, light_min, light_max, debug_mode)`
+- `c21.xyz`  = sun direction in tangent space
+- Picked above c0..c7 to avoid colliding with the game's world.ps
+  color-correction constants.
+
+### Hotkeys
+- **F2** cycle debug viz: 0 lit → 1 raw normal → 2 NdotL gray → 3 albedo only
+- **F3 / F4** bump amp -1 / +1 (range 0.5 .. 15)
+- **F5 / F6** light range narrow / widen
+- **F11** reset to defaults
+
+Each hotkey logs the new state to `ReShade.log` for confirmation.
+
+### v0.4.2 (skipped tag)
+v0.4.2 only had the static BUMP_AMP=5 in the shader; rolled into v0.4.3
+once the runtime tunability landed.
+
 ## [0.4.1] — 2026-05-10
 
 Adds an engine-bundled **stock fallback index + normals** so per-texture
