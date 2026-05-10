@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.7] — 2026-05-10
+
+Cover the two extra world.ps **variants** (`0xbea29c90` and
+`0xcc8904f8` — same sampler layout as the main world.ps, different
+fog / color-correction state) by substituting them with the same
+runtime-compiled HLSL replacement. NPCs / cops / barrels / items
+running through mesh.ps already work after restart of v0.4.6.
+
+### Changed
+- `WORLD_PS_CRCS[]` array replaces the single `WORLD_PS_CRC` constant.
+- Both `on_create_pipeline` and `on_init_pipeline` iterate the array.
+- Dump filter excludes all known CRCs (3 world variants + mesh.ps).
+
 ## [0.4.6] — 2026-05-10
 
 Scene-reactive lighting (lightmap-derived sun direction) + view-

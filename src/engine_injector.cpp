@@ -56,7 +56,16 @@
 namespace {
 
 // ── tunables ─────────────────────────────────────────────────────────
-constexpr uint32_t WORLD_PS_CRC          = 0x2ccf5eb7u;
+// world.ps comes in multiple variants — each LOD / fog state / color-
+// correction permutation has its own bytecode CRC. They all sample
+// s0=albedo, s1=lightmap; we substitute every known variant with our
+// single replacement (which adds normal sampling on s5 + lighting math).
+constexpr uint32_t WORLD_PS_CRCS[] = {
+    0x2ccf5eb7u,  // primary — original world.ps
+    0xbea29c90u,  // variant A (likely fog/no-fog or different color matrix)
+    0xcc8904f8u,  // variant B
+};
+constexpr uint32_t WORLD_PS_CRC          = 0x2ccf5eb7u;  // legacy alias
 constexpr UINT     NORMAL_SAMPLER        = 5;   // moved off s2 — game/ReShade was clobbering s2
 constexpr const char* DEFAULT_NORMAL_FILE = "neocron_default_normal.png";
 // Two indexes are loaded if present:
@@ -593,7 +602,11 @@ bool on_create_pipeline(reshade::api::device*,
 
         const std::vector<uint8_t>* repl = nullptr;
         const char* tag = nullptr;
-        if (c == WORLD_PS_CRC && !g_world_ps_bytecode.empty()) {
+        bool is_world_variant = false;
+        for (uint32_t known : WORLD_PS_CRCS) {
+            if (c == known) { is_world_variant = true; break; }
+        }
+        if (is_world_variant && !g_world_ps_bytecode.empty()) {
             repl = &g_world_ps_bytecode; tag = "world.ps";
         } else if (c == MESH_PS_CRC && !g_mesh_ps_bytecode.empty()) {
             repl = &g_mesh_ps_bytecode;  tag = "mesh.ps";
@@ -643,8 +656,9 @@ void on_init_pipeline(reshade::api::device*,
              desc->code_size == g_mesh_ps_bytecode.size())) {
             g_substituted_ps_pipelines.insert(pipeline.handle);
         }
-        if (g_dumped_ps.insert(c).second &&
-            c != WORLD_PS_CRC && c != MESH_PS_CRC)
+        bool is_known = (c == MESH_PS_CRC);
+        for (uint32_t known : WORLD_PS_CRCS) if (c == known) is_known = true;
+        if (g_dumped_ps.insert(c).second && !is_known)
             dump_ps_bytecode(c, desc->code, desc->code_size);
     }
 }
@@ -999,7 +1013,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.4.6 (ps_3_0 + lightmap-driven sun + view-dependent spec/rim) registered");
+                "renodx-engine: m4 v0.4.7 (world.ps × 3 variants + mesh.ps; ps_3_0; scene-reactive) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
