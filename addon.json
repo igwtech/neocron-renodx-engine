@@ -1,7 +1,7 @@
 {
   "id": "neocron-renodx-engine",
   "name": "Neocron RenoDX Engine — HLSL pixel-shader injection",
-  "version": "0.4.9",
+  "version": "0.5.1",
   "author": "Neocron Community",
   "description": "ReShade Add-on Edition .addon32 that hooks D3D9 create_pipeline to substitute Neocron's world.ps (CRC 0x2ccf5eb7) AND mesh.ps (CRC 0x96f566cb — NPCs, items, decals, signs) with runtime-compiled HLSL replacements. Per-texture normal-mapped Phong: each game texture is fingerprinted via D3D9 LockRect on first use, looked up against either the HD index (deployed by the nc2-hd-textures addon) or the engine-bundled stock index, and the matching `_n.png` is bound at sampler 5. Surfaces with no per-tex match pass through vanilla (no fake bump). Tunables (bump amp, light range, debug viz) live in the ReShade overlay → Add-ons tab.",
   "category": "graphics",
@@ -14,7 +14,7 @@
 
   "fetch": [
     {
-      "from": "https://github.com/igwtech/neocron-renodx-engine/releases/download/v0.4.9/neocron-renodx-engine.addon32",
+      "from": "https://github.com/igwtech/neocron-renodx-engine/releases/download/v0.5.1/neocron-renodx-engine.addon32",
       "extract": "",
       "files": [
         { "src": "neocron-renodx-engine.addon32", "dst": "neocron-renodx-engine.addon32" }

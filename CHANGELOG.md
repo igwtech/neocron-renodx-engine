@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.5.1] — 2026-05-10
+
+Diagnostics-first release. v0.4.9 left scenes mostly black, and we
+couldn't tell which channel of `albedo × vcol × lightmap × cc` was
+zero without rebuilding the binary every iteration. v0.5.1 exposes
+EVERY input as a slider in the overlay AND adds 7 new debug viz
+modes so the user can isolate the broken channel themselves.
+
+### New ImGui controls (overlay → Add-ons → Neocron RenoDX Engine)
+- `vcol -> 1.0 mix` — fade game's vcol toward white (0=use vcol, 1=force 1)
+- `lightmap -> 1.0 mix` — same for lightmap
+- `colorCorrection override` — slider replacing game's c4.x; -1=use game's
+- `albedo boost` — scalar multiplier on albedo before everything else
+
+### Debug viz expanded to 11 modes (was 4)
+- 0 Lit, 1 Raw normal, 2 NdotL gray, 3 Albedo (per-tex)
+- **4 Vanilla raw** — final formula output, no math
+- **5 Albedo channel** — pure tex2D(s0)
+- **6 Lightmap channel** — pure tex2D(s1)
+- **7 vcol channel** — interpolant after fallback
+- **8 cc.x grayscale** — game's colorCorrection.x as gray
+- **9 vcol after mix** — vcol post slider
+- **10 Lightmap after mix** — lm post slider
+
+### Conservative defaults
+- `lightmap-driven` 1.0 → 0.0 (fixed sun by default; lightmap-gradient
+  produced wrong-direction sun in some zones)
+- `light_min` 0.20 → 0.60 (less darkening when NdotL is low)
+- `light_max` 1.50 → 1.40
+- `bump_amp` 5.0 → 4.0
+- `spec_strength` 0.20 → 0.15
+- `rim_strength` 0.30 → 0.00 (was the vaseline source)
+
+### How to debug a scene
+1. Set Debug viz = 8 (cc.x gray) — if scene is black, game's c4 is zero
+2. Set Debug viz = 6 (lightmap) — confirm lightmap is non-zero
+3. Set Debug viz = 5 (albedo) — confirm sampler 0 isn't reading black
+4. Set Debug viz = 4 (vanilla raw) — see final formula output
+5. Use override sliders to bypass any broken channel.
+
 ## [0.4.9] — 2026-05-10
 
 Hotfix for v0.4.8: black screen at login menu. The unified replacement

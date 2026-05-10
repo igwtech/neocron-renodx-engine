@@ -99,6 +99,7 @@ constexpr UINT  SUN_PS_REG    = 21;   // c21 = sun direction xyz + bump_on flag 
 constexpr UINT  EXTRA_PS_REG  = 22;   // c22 = lm_driven, lm_amp, spec_strength, spec_shininess
 constexpr UINT  EXTRA2_PS_REG = 23;   // c23 = rim_strength, lm_tap_offset, screen_inv_w, screen_inv_h
 constexpr UINT  EXTRA3_PS_REG = 24;   // c24 = normal_y_flip, ...
+constexpr UINT  EXTRA4_PS_REG = 25;   // c25 = vcol_mix, lm_mix, cc_override, albedo_boost
 
 // Tunables (default values; hotkeys mutate at runtime)
 struct Tunables {
@@ -109,18 +110,18 @@ struct Tunables {
     float sun_x      = 0.408f, sun_y = 0.408f, sun_z = 0.816f;  // pre-normalised
     void reset() { *this = Tunables{}; }
 };
-std::atomic<float> g_bump_amp{5.0f};
-std::atomic<float> g_light_min{0.20f};
-std::atomic<float> g_light_max{1.50f};
+std::atomic<float> g_bump_amp{4.0f};
+std::atomic<float> g_light_min{0.60f};   // v0.5.0: less darkening (was 0.20)
+std::atomic<float> g_light_max{1.40f};
 std::atomic<int>   g_debug_mode{0};
 
-// New v0.4.6 scene-reactive tunables
-std::atomic<float> g_lm_driven   {1.0f};   // 0=fixed sun, 1=lightmap-gradient sun
-std::atomic<float> g_lm_amp      {4.0f};   // gradient amplification
-std::atomic<float> g_spec_strength{0.2f};   // halved vs v0.4.7 (was 0.4)
+// Scene-reactive tunables — defaults conservative in v0.5.0
+std::atomic<float> g_lm_driven   {0.0f};   // v0.5.0: fixed sun by default (lightmap-driven was producing wrong sun direction in some zones)
+std::atomic<float> g_lm_amp      {4.0f};
+std::atomic<float> g_spec_strength{0.15f}; // dialled back further
 std::atomic<float> g_spec_shiny  {16.0f};
-std::atomic<float> g_rim_strength{0.0f};    // OFF by default; was 0.3 → vaseline
-std::atomic<float> g_lm_tap      {0.005f}; // UV step for gradient sampling
+std::atomic<float> g_rim_strength{0.0f};   // OFF
+std::atomic<float> g_lm_tap      {0.005f};
 
 // Tracked screen size, refreshed each present.
 std::atomic<float> g_screen_inv_w{1.0f / 1920.0f};
@@ -129,6 +130,12 @@ std::atomic<float> g_screen_inv_h{1.0f / 1080.0f};
 // v0.4.8 — flip normal Y axis (DeepBump uses OpenGL Y-down convention,
 // game expects Y-up). Default ON since users see inverted bumps.
 std::atomic<float> g_normal_y_flip{1.0f};
+
+// v0.5.1 — vanilla-formula override knobs (c25)
+std::atomic<float> g_vcol_mix    {0.0f};   // 0=use game vcol, 1=force vcol=1
+std::atomic<float> g_lm_mix      {0.0f};   // 0=use lightmap, 1=force lm=1
+std::atomic<float> g_cc_override {-1.0f};  // <0: use game's cc.x; >=0: this value
+std::atomic<float> g_albedo_boost{1.0f};   // scalar pre-multiply
 
 // Fallback sun direction (used when LM_DRIVEN < 1.0)
 constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
@@ -191,6 +198,7 @@ float4 g_sun    : register(c21);
 float4 g_extra  : register(c22);
 float4 g_extra2 : register(c23);
 float4 g_extra3 : register(c24);
+float4 g_extra4 : register(c25);   // v0.5.1 overrides + debug
 
 float luminance(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 
@@ -211,16 +219,37 @@ float4 main(float2 uv     : TEXCOORD0,
     float4 vcol = (t2_active > 0.001) ? vcol_t :
                   (c0_active > 0.001) ? vcol_c : float4(1,1,1,1);
 
-    // Same defensive defaults for game constants that may be 0 on draws
-    // where the game didn't set them this frame (HUD has no lightmap; menu
-    // may not set colorCorrection).
-    float cc = (colorCorrection.x > 0.001) ? colorCorrection.x : 1.0;
-    float lm_present = saturate(lightmap.r + lightmap.g + lightmap.b);
-    float3 lm = (lm_present > 0.001) ? lightmap.rgb : float3(1,1,1);
+    // v0.5.1 — override knobs (g_extra4) so the user can debug each
+    // channel of the vanilla formula independently:
+    //   c25.x = vcol_mix         0=use vcol, 1=force vcol=1
+    //   c25.y = lm_mix           0=use lightmap, 1=force lm=1
+    //   c25.z = cc_override      negative=use game cc, >=0 use this value
+    //   c25.w = albedo_boost     scalar multiplier (default 1.0)
+    float vcol_mix      = saturate(g_extra4.x);
+    float lm_mix        = saturate(g_extra4.y);
+    float cc_override   = g_extra4.z;
+    float albedo_boost  = g_extra4.w;
 
-    // EXACT vanilla NC2 formula — matches all 4 disassembled game PS
-    float3 vanilla_rgb = albedo.rgb * vcol.rgb * lm * cc;
-    float  vanilla_a   = albedo.a   * vcol.a;
+    float3 vcol_eff = lerp(vcol.rgb, float3(1,1,1), vcol_mix);
+    float  vcola_eff = lerp(vcol.a,  1.0,           vcol_mix);
+    float3 lm       = lerp(lightmap.rgb, float3(1,1,1), lm_mix);
+    float  cc       = (cc_override >= 0.0) ? cc_override : colorCorrection.x;
+    float3 ab       = albedo.rgb * albedo_boost;
+
+    // EXACT vanilla NC2 formula (with overridable factors)
+    float3 vanilla_rgb = ab * vcol_eff * lm * cc;
+    float  vanilla_a   = albedo.a * vcola_eff;
+
+    // Per-channel debug viz BEFORE bump path so we can also inspect
+    // non-per-tex draws. Mode 0 falls through to normal rendering.
+    float dmode = g_params.w;
+    if (dmode > 3.5 && dmode < 4.5) return float4(vanilla_rgb, 1.0);            // 4 = vanilla raw
+    if (dmode > 4.5 && dmode < 5.5) return float4(albedo.rgb, 1.0);              // 5 = albedo channel
+    if (dmode > 5.5 && dmode < 6.5) return float4(lightmap.rgb, 1.0);            // 6 = lightmap channel
+    if (dmode > 6.5 && dmode < 7.5) return float4(vcol.rgb, 1.0);                // 7 = vcol channel
+    if (dmode > 7.5 && dmode < 8.5) return float4(colorCorrection.xxx, 1.0);     // 8 = cc.x as gray
+    if (dmode > 8.5 && dmode < 9.5) return float4(vcol_eff, 1.0);                // 9 = vcol after mix
+    if (dmode > 9.5)                return float4(lm,       1.0);                // 10 = lm after mix
 
     if (g_sun.w < 0.5) return float4(vanilla_rgb, vanilla_a);
 
@@ -850,11 +879,16 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         g_screen_inv_w.load(), g_screen_inv_h.load()
     };
     float extra3[4] = { g_normal_y_flip.load(), 0.0f, 0.0f, 0.0f };
+    float extra4[4] = {
+        g_vcol_mix.load(),   g_lm_mix.load(),
+        g_cc_override.load(), g_albedo_boost.load()
+    };
     dev->SetPixelShaderConstantF(PARAMS_PS_REG, params, 1);
     dev->SetPixelShaderConstantF(SUN_PS_REG,    sun,    1);
     dev->SetPixelShaderConstantF(EXTRA_PS_REG,  extra,  1);
     dev->SetPixelShaderConstantF(EXTRA2_PS_REG, extra2, 1);
     dev->SetPixelShaderConstantF(EXTRA3_PS_REG, extra3, 1);
+    dev->SetPixelShaderConstantF(EXTRA4_PS_REG, extra4, 1);
 
     g_world_draws.fetch_add(1, std::memory_order_relaxed);
     if (per_tex) {
@@ -908,7 +942,14 @@ void on_overlay(reshade::api::effect_runtime*) {
         "0 — Lit (full)",
         "1 — Raw normal RGB",
         "2 — NdotL grayscale",
-        "3 — Albedo only",
+        "3 — Albedo (per-tex only)",
+        "4 — Vanilla raw (no math)",
+        "5 — Albedo channel",
+        "6 — Lightmap channel",
+        "7 — vcol channel",
+        "8 — colorCorrection.x grayscale",
+        "9 — vcol after mix slider",
+        "10 — Lightmap after mix slider",
     };
     if (ImGui::Combo("Debug viz", &mode, MODES, IM_ARRAYSIZE(MODES))) g_debug_mode.store(mode);
 
@@ -931,23 +972,38 @@ void on_overlay(reshade::api::effect_runtime*) {
     if (ImGui::SliderFloat("Rim strength",       &rs, 0.0f, 2.0f,  "%.2f")) g_rim_strength.store(rs);
 
     ImGui::Separator();
+    ImGui::TextUnformatted("Vanilla formula overrides (v0.5.1 debug)");
+    float vmix = g_vcol_mix.load();
+    float lmix = g_lm_mix.load();
+    float ccov = g_cc_override.load();
+    float aboost = g_albedo_boost.load();
+    if (ImGui::SliderFloat("vcol -> 1.0 mix",        &vmix, 0.0f, 1.0f, "%.2f")) g_vcol_mix.store(vmix);
+    if (ImGui::SliderFloat("lightmap -> 1.0 mix",    &lmix, 0.0f, 1.0f, "%.2f")) g_lm_mix.store(lmix);
+    if (ImGui::SliderFloat("colorCorrection override (-1=game)", &ccov, -1.0f, 2.0f, "%.2f")) g_cc_override.store(ccov);
+    if (ImGui::SliderFloat("albedo boost",           &aboost, 0.5f, 4.0f, "%.2f")) g_albedo_boost.store(aboost);
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Normal map convention");
     bool y_flip = g_normal_y_flip.load() > 0.5f;
     if (ImGui::Checkbox("Flip normal Y (DeepBump=ON, Y-up=OFF)", &y_flip))
         g_normal_y_flip.store(y_flip ? 1.0f : 0.0f);
 
     if (ImGui::Button("Reset to defaults")) {
-        g_bump_amp.store(5.0f);
-        g_light_min.store(0.20f);
-        g_light_max.store(1.50f);
+        g_bump_amp.store(4.0f);
+        g_light_min.store(0.60f);
+        g_light_max.store(1.40f);
         g_debug_mode.store(0);
-        g_lm_driven.store(1.0f);
+        g_lm_driven.store(0.0f);
         g_lm_amp.store(4.0f);
         g_lm_tap.store(0.005f);
-        g_spec_strength.store(0.2f);   // halved — vaseline fix default
+        g_spec_strength.store(0.15f);
         g_spec_shiny.store(16.0f);
-        g_rim_strength.store(0.0f);    // off by default — was the vaseline source
+        g_rim_strength.store(0.0f);
         g_normal_y_flip.store(1.0f);
+        g_vcol_mix.store(0.0f);
+        g_lm_mix.store(0.0f);
+        g_cc_override.store(-1.0f);
+        g_albedo_boost.store(1.0f);
         log_tunables("ImGui reset");
     }
 
@@ -1026,7 +1082,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.4.8 (UNIFIED replacement; vanilla-byte-correct; UI-safe) registered");
+                "renodx-engine: m4 v0.5.1 (per-channel debug viz + vanilla overrides) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
