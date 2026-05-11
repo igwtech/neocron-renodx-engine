@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.6.0] — 2026-05-10
+
+Workaround release. After v0.5.2-v0.5.9 chased down what looked like
+sampler / interpolant problems, the smoking gun is now:
+
+- Sampler 1 (lightmap) IS bound 100% of draws (`s1 bound: 100%`)
+- The texture has real, varied content (verified by `LockRect` dump
+  saved as `s1_lightmap.bgra` → bright red neon patterns on dark
+  background)
+- But our shader sampling returns uniform gray ≈ the texture's
+  average colour
+
+Best current hypothesis: **DXVK isolates descriptor sets between the
+game's original pipeline and our substituted pipeline**. The texture
+binding doesn't propagate to our pipeline's sampler descriptor — DXVK
+returns its placeholder grey for what it considers "unbound" samplers.
+
+Rather than block forever on this, v0.6.0 ships sensible defaults
+that bypass the broken channels:
+- `lm_mix = 1.0` — force lightmap = 1.0 (sidestep the broken sample)
+- `cc_override = 1.0` — bypass game's c4
+- `vcol_mix = 0.0` — vcol works (interpolant TEXCOORD2/COLOR0 reaches us)
+
+End-to-end result: matches the user's manually-tuned image #74 from
+v0.5.1 — bright, with per-texture bumps visible. Loses the per-zone
+baked atmospheric lightmap (everything looks daytime-bright).
+
+Investigation continues — proper fix requires either:
+- Hooking ReShade's `bind_sampler_descriptor_table` event to force-
+  rebind game's textures into our pipeline's descriptor set, OR
+- Switching from PS substitution to a separate post-draw pass that
+  composites bumps over the game's vanilla output.
+
 ## [0.5.4] — 2026-05-10
 
 Diagnostic-only release. v0.5.3's switch to ps_2_b *did* let the

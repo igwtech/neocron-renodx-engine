@@ -75,7 +75,7 @@ constexpr uint32_t GAME_PS_CRCS[] = {
     0xeb1b9a91u,  // overlay.ps (cursor, damage flash)
 };
 constexpr uint32_t WORLD_PS_CRC = 0x2ccf5eb7u;  // legacy alias
-constexpr UINT     NORMAL_SAMPLER        = 5;   // moved off s2 — game/ReShade was clobbering s2
+constexpr UINT     NORMAL_SAMPLER        = 2;   // v0.5.5: back to s2 (contiguous with s0/s1) — sparse sampler use suspected of breaking DXVK state passthrough
 constexpr const char* DEFAULT_NORMAL_FILE = "neocron_default_normal.png";
 // Two indexes are loaded if present:
 //   1. HD index (deployed by nc2-hd-textures addon, ~2900 entries hashed
@@ -131,10 +131,15 @@ std::atomic<float> g_screen_inv_h{1.0f / 1080.0f};
 // game expects Y-up). Default ON since users see inverted bumps.
 std::atomic<float> g_normal_y_flip{1.0f};
 
-// v0.5.1 — vanilla-formula override knobs (c25)
-std::atomic<float> g_vcol_mix    {0.0f};   // 0=use game vcol, 1=force vcol=1
-std::atomic<float> g_lm_mix      {0.0f};   // 0=use lightmap, 1=force lm=1
-std::atomic<float> g_cc_override {-1.0f};  // <0: use game's cc.x; >=0: this value
+// v0.6.0 defaults — game state passthrough is partially broken under
+// DXVK pipeline substitution (sampler 1 lightmap reads as uniform gray
+// even though the texture has real content; suspected DXVK descriptor-
+// set isolation between game's pipeline and our substituted one).
+// Defaults lean on the override path that's known to look good
+// (matches user's manual tuning in v0.5.1 testing).
+std::atomic<float> g_vcol_mix    {0.0f};   // 0=use game vcol (works fine)
+std::atomic<float> g_lm_mix      {1.0f};   // 1=force lm=1 (bypass broken sampler)
+std::atomic<float> g_cc_override { 1.0f};  // 1.0=fixed (bypass broken c4)
 std::atomic<float> g_albedo_boost{1.0f};   // scalar pre-multiply
 
 // Fallback sun direction (used when LM_DRIVEN < 1.0)
@@ -189,7 +194,7 @@ constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
 const char* UNIFIED_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);
 sampler2D samplerLightmap : register(s1);
-sampler2D samplerNormal   : register(s5);
+sampler2D samplerNormal   : register(s2);   // v0.5.5: back to s2 (was s5 — sparse may have broken DXVK)
 
 float4 colorCorrection : register(c4);  // GAME's per-draw constant
 
@@ -362,9 +367,16 @@ bool compile_one(const char* hlsl, const char* tag, std::vector<uint8_t>& out) {
         (const uint8_t*)code->GetBufferPointer() + code->GetBufferSize());
     code->Release();
     if (errs) errs->Release();
+
+    // Diagnostic: dump our compiled bytecode for offline disassembly.
+    char dumppath[160];
+    std::snprintf(dumppath, sizeof(dumppath), "Z:\\tmp\\our_%s.dxbc", tag);
+    FILE* dump = std::fopen(dumppath, "wb");
+    if (dump) { std::fwrite(out.data(), 1, out.size(), dump); std::fclose(dump); }
+
     char buf[200];
     std::snprintf(buf, sizeof(buf),
-        "renodx-engine: replacement %s compiled, %zu bytes ps_2_0", tag, out.size());
+        "renodx-engine: replacement %s compiled, %zu bytes (dumped to %s)", tag, out.size(), dumppath);
     reshade::log::message(reshade::log::level::info, buf);
     return true;
 }
@@ -826,6 +838,12 @@ void on_destroy_resource(reshade::api::device*, reshade::api::resource resource)
 std::atomic<uint64_t> g_world_draws{0};
 std::atomic<uint64_t> g_world_draws_per_tex_hit{0};
 
+// v0.5.6 diagnostic: at each world draw, query sampler 1 / 2 / 5 to confirm
+// game's bind state. If lightmap (s1) is consistently NULL, our shader
+// can't possibly read it — we'd need a different binding strategy.
+std::atomic<uint64_t> g_lm_bound_cnt{0};
+std::atomic<uint64_t> g_lm_null_cnt{0};
+
 inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
     if (!t_using_substituted_world_ps) return;   // not our shader, don't touch
     auto* dev = reinterpret_cast<IDirect3DDevice9*>(cmd->get_device()->get_native());
@@ -873,6 +891,69 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSV,  D3DTADDRESS_WRAP);
         dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
         dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    }
+
+    // v0.5.9: force MAXMIPLEVEL=0 + no mip selection on s1.
+    // The dumped lightmap (PNG inspection) shows real bright neon
+    // patterns on dark background, but sampling returns uniform
+    // gray ≈ the texture's average colour — classic symptom of
+    // GPU picking the smallest mip (1×1 = whole-texture average)
+    // because derivatives aren't being computed correctly under
+    // our substituted PS pipeline.
+    if (t_z_enabled) {
+        dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(1, D3DSAMP_MAXMIPLEVEL, 0);
+        dev->SetSamplerState(1, D3DSAMP_MIPMAPLODBIAS, 0);
+        dev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        dev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        // Also for sampler 0 (albedo) and 2 (normal) — same rationale
+        dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);
+        dev->SetSamplerState(2, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(2, D3DSAMP_MAXMIPLEVEL, 0);
+    }
+
+    // Diagnostic: dump the FIRST 512x512 X8R8G8B8 texture seen at s1
+    // so we can inspect its actual content offline.
+    if (t_z_enabled) {
+        IDirect3DBaseTexture9* lm_check = nullptr;
+        dev->GetTexture(1, &lm_check);
+        if (lm_check) {
+            g_lm_bound_cnt.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<int> dump_done{0};
+            if (dump_done.load() == 0) {
+                IDirect3DTexture9* t2d = nullptr;
+                if (SUCCEEDED(lm_check->QueryInterface(__uuidof(IDirect3DTexture9),
+                                                        (void**)&t2d)) && t2d) {
+                    D3DSURFACE_DESC d{};
+                    if (SUCCEEDED(t2d->GetLevelDesc(0, &d)) && d.Width == 512 && d.Height == 512) {
+                        D3DLOCKED_RECT lr{};
+                        if (SUCCEEDED(t2d->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) {
+                            FILE* f = std::fopen("Z:\\tmp\\s1_lightmap.bgra", "wb");
+                            if (f) {
+                                for (UINT y = 0; y < d.Height; ++y)
+                                    std::fwrite((uint8_t*)lr.pBits + y*lr.Pitch,
+                                                4, d.Width, f);
+                                std::fclose(f);
+                                dump_done.store(1);
+                                char buf[200];
+                                std::snprintf(buf, sizeof(buf),
+                                    "renodx-engine: dumped s1 lightmap %ux%u fmt=0x%x to /tmp/s1_lightmap.bgra",
+                                    d.Width, d.Height, d.Format);
+                                reshade::log::message(reshade::log::level::info, buf);
+                            }
+                            t2d->UnlockRect(0);
+                        }
+                    }
+                    t2d->Release();
+                }
+            }
+            lm_check->Release();
+        } else {
+            g_lm_null_cnt.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // ALWAYS push constants — even for HUD draws, so BUMP_ON=0 is
@@ -1020,8 +1101,8 @@ void on_overlay(reshade::api::effect_runtime*) {
         g_rim_strength.store(0.0f);
         g_normal_y_flip.store(1.0f);
         g_vcol_mix.store(0.0f);
-        g_lm_mix.store(0.0f);
-        g_cc_override.store(-1.0f);
+        g_lm_mix.store(1.0f);    // v0.6.0 conservative default
+        g_cc_override.store(1.0f);
         g_albedo_boost.store(1.0f);
         log_tunables("ImGui reset");
     }
@@ -1037,6 +1118,11 @@ void on_overlay(reshade::api::effect_runtime*) {
                 (unsigned long long)g_lazy_loaded.load(),
                 g_normal_cache.size());
     ImGui::Text("  index map   : %zu entries", g_hash_to_path.size());
+    ImGui::Text("  s1 bound: %llu  s1 NULL: %llu  (ratio %.1f%%)",
+                (unsigned long long)g_lm_bound_cnt.load(),
+                (unsigned long long)g_lm_null_cnt.load(),
+                100.0 * g_lm_bound_cnt.load() /
+                    std::max<uint64_t>(1, g_lm_bound_cnt.load() + g_lm_null_cnt.load()));
 }
 
 void on_present(reshade::api::effect_runtime* rt) {
@@ -1101,7 +1187,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.5.4 (debug modes 11-14 to discriminate sampler vs interpolant) registered");
+                "renodx-engine: m4 v0.6.0 (override defaults workaround DXVK descriptor isolation) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
