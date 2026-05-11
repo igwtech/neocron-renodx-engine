@@ -71,8 +71,13 @@ constexpr uint32_t GAME_PS_CRCS[] = {
     0x2ccf5eb7u,  // world.ps primary
     0xbea29c90u,  // world.ps variant A
     0xcc8904f8u,  // world.ps variant B
-    0x96f566cbu,  // mesh.ps (NPCs, items, decals, HUD)
-    0xeb1b9a91u,  // overlay.ps (cursor, damage flash)
+    // mesh.ps + overlay.ps DELIBERATELY skipped — substituting them
+    // triggers DXVK descriptor isolation (sampler 1 reads as gray
+    // for unrelated reasons, even on world.ps draws). Cost: NPCs /
+    // items / HUD don't get per-texture normals. Worth it for the
+    // working baked lightmap on the world.
+    // 0x96f566cbu,  // mesh.ps (NPCs, items, decals, HUD)
+    // 0xeb1b9a91u,  // overlay.ps (cursor, damage flash)
 };
 constexpr uint32_t WORLD_PS_CRC = 0x2ccf5eb7u;  // legacy alias
 constexpr UINT     NORMAL_SAMPLER        = 2;   // v0.5.5: back to s2 (contiguous with s0/s1) — sparse sampler use suspected of breaking DXVK state passthrough
@@ -131,16 +136,13 @@ std::atomic<float> g_screen_inv_h{1.0f / 1080.0f};
 // game expects Y-up). Default ON since users see inverted bumps.
 std::atomic<float> g_normal_y_flip{1.0f};
 
-// v0.6.0 defaults — game state passthrough is partially broken under
-// DXVK pipeline substitution (sampler 1 lightmap reads as uniform gray
-// even though the texture has real content; suspected DXVK descriptor-
-// set isolation between game's pipeline and our substituted one).
-// Defaults lean on the override path that's known to look good
-// (matches user's manual tuning in v0.5.1 testing).
+// v0.6.1 — try real lightmap again now that we PreLoad() it per-draw.
+// If the screenshot shows actual baked NC2 atmosphere, lm_mix stays 0.
+// If still gray, default back to the v0.6.0 workaround.
 std::atomic<float> g_vcol_mix    {0.0f};   // 0=use game vcol (works fine)
-std::atomic<float> g_lm_mix      {1.0f};   // 1=force lm=1 (bypass broken sampler)
-std::atomic<float> g_cc_override { 1.0f};  // 1.0=fixed (bypass broken c4)
-std::atomic<float> g_albedo_boost{1.0f};   // scalar pre-multiply
+std::atomic<float> g_lm_mix      {0.0f};   // try the real lightmap again
+std::atomic<float> g_cc_override {-1.0f};  // try game's cc again
+std::atomic<float> g_albedo_boost{1.0f};
 
 // Fallback sun direction (used when LM_DRIVEN < 1.0)
 constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
@@ -915,41 +917,17 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         dev->SetSamplerState(2, D3DSAMP_MAXMIPLEVEL, 0);
     }
 
-    // Diagnostic: dump the FIRST 512x512 X8R8G8B8 texture seen at s1
-    // so we can inspect its actual content offline.
+    // v0.6.1 — PreLoad() workaround: force DXVK to re-upload lightmap
+    // VRAM before each sample. Theory: DXVK only uploads texture content
+    // when the ORIGINAL pipeline references it; our substituted pipeline
+    // doesn't trigger the upload, so VRAM stays uniform-grey placeholder.
+    // PreLoad() is a no-op for GPU-already-uploaded textures, cheap.
     if (t_z_enabled) {
         IDirect3DBaseTexture9* lm_check = nullptr;
         dev->GetTexture(1, &lm_check);
         if (lm_check) {
             g_lm_bound_cnt.fetch_add(1, std::memory_order_relaxed);
-            static std::atomic<int> dump_done{0};
-            if (dump_done.load() == 0) {
-                IDirect3DTexture9* t2d = nullptr;
-                if (SUCCEEDED(lm_check->QueryInterface(__uuidof(IDirect3DTexture9),
-                                                        (void**)&t2d)) && t2d) {
-                    D3DSURFACE_DESC d{};
-                    if (SUCCEEDED(t2d->GetLevelDesc(0, &d)) && d.Width == 512 && d.Height == 512) {
-                        D3DLOCKED_RECT lr{};
-                        if (SUCCEEDED(t2d->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) {
-                            FILE* f = std::fopen("Z:\\tmp\\s1_lightmap.bgra", "wb");
-                            if (f) {
-                                for (UINT y = 0; y < d.Height; ++y)
-                                    std::fwrite((uint8_t*)lr.pBits + y*lr.Pitch,
-                                                4, d.Width, f);
-                                std::fclose(f);
-                                dump_done.store(1);
-                                char buf[200];
-                                std::snprintf(buf, sizeof(buf),
-                                    "renodx-engine: dumped s1 lightmap %ux%u fmt=0x%x to /tmp/s1_lightmap.bgra",
-                                    d.Width, d.Height, d.Format);
-                                reshade::log::message(reshade::log::level::info, buf);
-                            }
-                            t2d->UnlockRect(0);
-                        }
-                    }
-                    t2d->Release();
-                }
-            }
+            lm_check->PreLoad();
             lm_check->Release();
         } else {
             g_lm_null_cnt.fetch_add(1, std::memory_order_relaxed);
@@ -1101,8 +1079,8 @@ void on_overlay(reshade::api::effect_runtime*) {
         g_rim_strength.store(0.0f);
         g_normal_y_flip.store(1.0f);
         g_vcol_mix.store(0.0f);
-        g_lm_mix.store(1.0f);    // v0.6.0 conservative default
-        g_cc_override.store(1.0f);
+        g_lm_mix.store(0.0f);
+        g_cc_override.store(-1.0f);
         g_albedo_boost.store(1.0f);
         log_tunables("ImGui reset");
     }
@@ -1187,7 +1165,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
             reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.6.0 (override defaults workaround DXVK descriptor isolation) registered");
+                "renodx-engine: m4 v0.7.0 (world.ps × 3 variants only — proper lightmap + bumps) registered");
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "

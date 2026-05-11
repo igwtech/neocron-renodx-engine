@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.7.0] — 2026-05-10
+
+**The world lightmap is back.** Bisecting which of the 5 substituted
+pixel shaders triggered DXVK's descriptor-isolation bug, we found
+that substituting `mesh.ps` (`0x96f566cb`) or `overlay.ps`
+(`0xeb1b9a91`) somehow propagates the bug to ALL substituted
+pipelines — even world.ps draws then read sampler 1 as uniform gray.
+
+Substituting only the **3 world.ps CRCs** (`0x2ccf5eb7`,
+`0xbea29c90`, `0xcc8904f8`) keeps everything working: real lightmap
+atmosphere, proper colorCorrection, per-texture normal mapping on
+world surfaces.
+
+### Trade-off
+NPCs / items / decals / HUD now render vanilla (no per-texture
+normals). The world geometry — walls, floors, ceilings, signs —
+gets the full bump treatment.
+
+### Defaults restored
+- `lm_mix = 0.0` (use real game lightmap)
+- `cc_override = -1` (use real game colorCorrection)
+- All v0.6.0 workaround defaults reverted
+
+### Investigation note
+Root cause of the descriptor-isolation issue is still unidentified.
+Best guess: substituting mesh.ps causes DXVK to flush / re-allocate
+some shared descriptor pool that strips world.ps's sampler bindings.
+Future work: substitute mesh.ps via a different mechanism (post-
+draw composition or vertex-shader ID matching) to get NPC bumps
+without breaking the world.
+
 ## [0.6.0] — 2026-05-10
 
 Workaround release. After v0.5.2-v0.5.9 chased down what looked like
