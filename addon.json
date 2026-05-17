@@ -1,35 +1,63 @@
 {
   "id": "neocron-renodx-engine",
-  "name": "Neocron RenoDX Engine — HLSL pixel-shader injection",
-  "version": "0.7.0",
+  "name": "Neocron RenoDX Engine \u2014 HLSL pixel-shader injection",
+  "version": "0.9.7",
   "author": "Neocron Community",
-  "description": "ReShade Add-on Edition .addon32 that hooks D3D9 create_pipeline to substitute Neocron's world.ps (CRC 0x2ccf5eb7) AND mesh.ps (CRC 0x96f566cb — NPCs, items, decals, signs) with runtime-compiled HLSL replacements. Per-texture normal-mapped Phong: each game texture is fingerprinted via D3D9 LockRect on first use, looked up against either the HD index (deployed by the nc2-hd-textures addon) or the engine-bundled stock index, and the matching `_n.png` is bound at sampler 5. Surfaces with no per-tex match pass through vanilla (no fake bump). Tunables (bump amp, light range, debug viz) live in the ReShade overlay → Add-ons tab.",
+  "description": "ReShade Add-on Edition .addon32 hooking D3D9 create_pipeline to substitute Neocron's world.ps (CRC 0x2ccf5eb7) with a runtime-compiled Cook-Torrance PBR shader. Each game texture is fingerprinted via D3D9 LockRect (64 KiB + dims) and looked up in the triplet index from the nc2-hd-textures addon. On hit it binds the creatively-regenerated HD albedo at s0 (bypassing the native 512px clamp), AI normals at s2 and ORME (R=occlusion G=roughness B=metallic A=emissive) at s3. v0.9: the baked lightmap is treated as incident irradiance feeding a real metallic-workflow GGX BRDF (D/G/F) + ambient IBL + ACES tonemap/exposure, instead of post-multiplying vanilla colour. Non-matched surfaces pass through vanilla. Tunables (Exposure, Ambient, PBR strength, bump, ORME debug viz) in the ReShade overlay \u2192 Add-ons tab.",
   "category": "graphics",
-  "tags": ["reshade", "addon", "d3d9", "hlsl", "pixel-shader", "renodx", "engine-injection", "normal-mapping", "per-texture-lookup", "imgui"],
-
-  "files": [
-    { "src": "assets/default_normal.png",     "dst": "neocron_default_normal.png" },
-    { "src": "assets/stock_brick_index.txt",  "dst": "neocron_stock_index.txt" }
+  "tags": [
+    "reshade",
+    "addon",
+    "d3d9",
+    "hlsl",
+    "pixel-shader",
+    "renodx",
+    "engine-injection",
+    "pbr",
+    "normal-mapping",
+    "orme",
+    "per-texture-lookup",
+    "imgui"
   ],
-
+  "files": [
+    {
+      "src": "assets/default_normal.png",
+      "dst": "neocron_default_normal.png"
+    },
+    {
+      "src": "assets/stock_brick_index.txt",
+      "dst": "neocron_stock_index.txt"
+    }
+  ],
   "fetch": [
     {
-      "from": "https://github.com/igwtech/neocron-renodx-engine/releases/download/v0.7.0/neocron-renodx-engine.addon32",
+      "from": "https://github.com/igwtech/neocron-renodx-engine/releases/download/v0.9.0/neocron-renodx-engine.addon32",
       "extract": "",
       "files": [
-        { "src": "neocron-renodx-engine.addon32", "dst": "neocron-renodx-engine.addon32" }
+        {
+          "src": "neocron-renodx-engine.addon32",
+          "dst": "neocron-renodx-engine.addon32"
+        }
       ]
     },
     {
       "from": "https://github.com/igwtech/neocron-renodx-engine/releases/download/v0.4.1/stock_brick_normals.tar.gz",
       "extract": "tar.gz",
       "files": [
-        { "src": "*",  "dst": "gfx_normals_stock/" }
+        {
+          "src": "*",
+          "dst": "gfx_normals_stock/"
+        }
       ]
     }
   ],
-
-  "expects": ["neocronclient.exe", "d3d9.dll", "d3dcompiler_47.dll"],
-  "requires": ["neocron-renodx"],
+  "expects": [
+    "neocronclient.exe",
+    "d3d9.dll",
+    "d3dcompiler_47.dll"
+  ],
+  "requires": [
+    "neocron-renodx"
+  ],
   "conflicts": []
 }

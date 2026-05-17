@@ -40,6 +40,7 @@
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
 #define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG   // v0.9: albedo ships as JPG (2GB release-asset limit)
 #include "stb_image.h"
 
 #include <atomic>
@@ -81,6 +82,8 @@ constexpr uint32_t GAME_PS_CRCS[] = {
 };
 constexpr uint32_t WORLD_PS_CRC = 0x2ccf5eb7u;  // legacy alias
 constexpr UINT     NORMAL_SAMPLER        = 2;   // v0.5.5: back to s2 (contiguous with s0/s1) — sparse sampler use suspected of breaking DXVK state passthrough
+constexpr UINT     ALBEDO_SAMPLER        = 0;   // v0.8: HD albedo replaces the game's clamped-512 s0 (only renodx bypasses the native clamp)
+constexpr UINT     ORME_SAMPLER          = 3;   // v0.8: ORME (R=occ G=rough B=metal A=emis), contiguous after normal
 constexpr const char* DEFAULT_NORMAL_FILE = "neocron_default_normal.png";
 // Two indexes are loaded if present:
 //   1. HD index (deployed by nc2-hd-textures addon, ~2900 entries hashed
@@ -92,10 +95,14 @@ constexpr const char* DEFAULT_NORMAL_FILE = "neocron_default_normal.png";
 // CHANGELOG).
 constexpr const char* HD_INDEX_FILE     = "neocron_texture_index.txt";
 constexpr const char* STOCK_INDEX_FILE  = "neocron_stock_index.txt";
-constexpr const char* HD_CORPUS_DIR     = "gfx_normals\\";
-constexpr const char* STOCK_CORPUS_DIR  = "gfx_normals_stock\\";
+constexpr const char* HD_CORPUS_DIR     = "gfx_pbr\\";          // v0.8: triplet corpus (albedo/normal/orme) deployed by nc2-hd-textures
+constexpr const char* STOCK_CORPUS_DIR  = "gfx_normals_stock\\"; // legacy normal-only fallback (2-token lines)
 
-constexpr size_t HASH_SAMPLE_BYTES = 4096;  // must match build-hash-index.py
+// v0.8: 64 KiB (was 4 KiB). NC2 world textures are DXT — linear
+// block-rows, no LockRect row padding — so offline-tight == runtime
+// pitch and the proven match holds, while genuine hash collisions drop
+// 69 -> 21. MUST stay in lockstep with build_pbr_index.py HASH_BYTES.
+constexpr size_t HASH_SAMPLE_BYTES = 65536;
 constexpr size_t NORMAL_CACHE_MAX  = 256;   // cap LRU; ~50 MB for typical 256² normals
 
 // Pixel-shader constant registers — c0..c7 reserved for game's shaders.
@@ -103,7 +110,7 @@ constexpr UINT  PARAMS_PS_REG = 20;   // c20 = bump_amp, light_min, light_max, d
 constexpr UINT  SUN_PS_REG    = 21;   // c21 = sun direction xyz + bump_on flag w
 constexpr UINT  EXTRA_PS_REG  = 22;   // c22 = lm_driven, lm_amp, spec_strength, spec_shininess
 constexpr UINT  EXTRA2_PS_REG = 23;   // c23 = rim_strength, lm_tap_offset, screen_inv_w, screen_inv_h
-constexpr UINT  EXTRA3_PS_REG = 24;   // c24 = normal_y_flip, ...
+constexpr UINT  EXTRA3_PS_REG = 24;   // c24 = normal_y_flip, have_orme, pbr_strength, have_hd_albedo
 constexpr UINT  EXTRA4_PS_REG = 25;   // c25 = vcol_mix, lm_mix, cc_override, albedo_boost
 
 // Tunables (default values; hotkeys mutate at runtime)
@@ -116,8 +123,8 @@ struct Tunables {
     void reset() { *this = Tunables{}; }
 };
 std::atomic<float> g_bump_amp{4.0f};
-std::atomic<float> g_light_min{0.60f};   // v0.5.0: less darkening (was 0.20)
-std::atomic<float> g_light_max{1.40f};
+std::atomic<float> g_light_min{0.60f};   // v0.9: unused by Cook-Torrance path
+std::atomic<float> g_light_max{1.00f};   // v0.9: REPURPOSED -> Exposure (g_params.z)
 std::atomic<int>   g_debug_mode{0};
 
 // Scene-reactive tunables — defaults conservative in v0.5.0
@@ -125,7 +132,7 @@ std::atomic<float> g_lm_driven   {0.0f};   // v0.5.0: fixed sun by default (ligh
 std::atomic<float> g_lm_amp      {4.0f};
 std::atomic<float> g_spec_strength{0.15f}; // dialled back further
 std::atomic<float> g_spec_shiny  {16.0f};
-std::atomic<float> g_rim_strength{0.0f};   // OFF
+std::atomic<float> g_rim_strength{0.35f};  // v0.9: REPURPOSED -> Ambient (g_extra2.x)
 std::atomic<float> g_lm_tap      {0.005f};
 
 // Tracked screen size, refreshed each present.
@@ -143,6 +150,8 @@ std::atomic<float> g_vcol_mix    {0.0f};   // 0=use game vcol (works fine)
 std::atomic<float> g_lm_mix      {0.0f};   // try the real lightmap again
 std::atomic<float> g_cc_override {-1.0f};  // try game's cc again
 std::atomic<float> g_albedo_boost{1.0f};
+// v0.8: master strength for the ORME/PBR contribution (AO·rough·metal·emis)
+std::atomic<float> g_pbr_strength{1.0f};
 
 // Fallback sun direction (used when LM_DRIVEN < 1.0)
 constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
@@ -194,9 +203,10 @@ constexpr float SUN_X = 0.408f, SUN_Y = 0.408f, SUN_Z = 0.816f;
 // Bump path (BUMP_ON=1) adds normal-mapped diffuse + view-dependent
 // spec / rim ON TOP of the vanilla colour.
 const char* UNIFIED_PS_HLSL = R"hlsl(
-sampler2D samplerAlbedo   : register(s0);
+sampler2D samplerAlbedo   : register(s0);   // v0.8: our HD regen replaces the game's clamped-512 albedo here
 sampler2D samplerLightmap : register(s1);
 sampler2D samplerNormal   : register(s2);   // v0.5.5: back to s2 (was s5 — sparse may have broken DXVK)
+sampler2D samplerOrme     : register(s3);   // v0.8: R=occlusion G=roughness B=metallic A=emissive
 
 float4 colorCorrection : register(c4);  // GAME's per-draw constant
 
@@ -265,60 +275,147 @@ float4 main(float2 uv     : TEXCOORD0,
     if (dmode > 12.5 && dmode < 13.5) {                                           // 13 = TEXCOORD1 raw (uv_lm as gradient)
         return float4(uv_lm, 0.0, 1.0);
     }
-    if (dmode > 13.5)                                                             // 14 = TEXCOORD0 raw for comparison
-        return float4(uv, 0.0, 1.0);
+    if (dmode > 13.5 && dmode < 14.5)                                             // 14 = TEXCOORD0 raw
+        return float4(uv, 0.0, 1.0);   // bounded: modes 15-19 fall through to ORME debug
 
     if (g_sun.w < 0.5) return float4(vanilla_rgb, vanilla_a);
 
-    // --- Normal in tangent space + Y flip toggle (DeepBump=Y-down) ---
+    // mesh.ps (g_sun.w==2): minimal SAFE path — only sample our normal
+    // at s2 (s0/s3 left untouched by the C++ side), no Cook-Torrance,
+    // no extra lightmap fetch. Just a gentle normal-mapped relief on the
+    // game's own vanilla mesh colour. Avoids the descriptor-isolation
+    // crash that full PBR on the high-frequency mesh pipeline caused.
+    if (g_sun.w > 1.5) {
+        float3 nm = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
+        nm.y *= (g_extra3.x > 0.5) ? -1.0 : 1.0;
+        float3 N2 = normalize(float3(nm.xy * g_params.x, nm.z));
+        float bump = saturate(0.5 + 0.5 * N2.z);
+        return float4(vanilla_rgb * lerp(0.82, 1.18, bump), vanilla_a);
+    }
+
+    // ───────────────────────── v0.9 Cook-Torrance ──────────────────────
+    // The baked lightmap is treated as the INCIDENT RADIANCE (irradiance)
+    // arriving at the surface — its intensity is the light, its gradient
+    // the dominant direction. We light a real metallic-workflow GGX BRDF
+    // with it instead of doing `albedo·lightmap` and smearing fake spec.
+    // No scene/light list is available to a D3D9 PS, so the lightmap is
+    // still the only world-lighting source — but used AS light, not as a
+    // post-multiply. ps_2_b: tangent-space view (true screen VPOS needs
+    // ps_3_0, deferred — would regress interpolant passthrough on DXVK).
+    static const float PI = 3.14159265;
+
     float3 n_raw = tex2D(samplerNormal, uv).rgb * 2.0 - 1.0;
     n_raw.y *= (g_extra3.x > 0.5) ? -1.0 : 1.0;
-    float3 n_ts  = normalize(float3(n_raw.xy * g_params.x, n_raw.z));
+    float3 N = normalize(float3(n_raw.xy * g_params.x, n_raw.z));
 
-    // --- Light direction: blend fixed sun ↔ lightmap-gradient ---
-    float lm_d = g_extra.x;
+    float4 orme   = tex2D(samplerOrme, uv);
+    float has_orme = saturate(g_extra3.y);
+    float pbr_k    = g_extra3.z;
+    float ao    = lerp(1.0, orme.r, has_orme);
+    float rough = clamp(lerp(0.5, orme.g, has_orme), 0.045, 1.0);
+    float metal = orme.b * has_orme;
+    float emis  = orme.a * has_orme;
+
+    // ORME per-channel debug (15-19)
+    if (dmode > 14.5 && dmode < 15.5) return float4(ao.xxx, 1.0);
+    if (dmode > 15.5 && dmode < 16.5) return float4(rough.xxx, 1.0);
+    if (dmode > 16.5 && dmode < 17.5) return float4(metal.xxx, 1.0);
+    if (dmode > 17.5 && dmode < 18.5) return float4(emis.xxx, 1.0);
+    if (dmode > 18.5 && dmode < 19.5) return float4(orme.rgb, 1.0);
+
+    // material (metallic workflow)
+    float3 base_col = albedo.rgb * albedo_boost;
+    float3 F0   = lerp(float3(0.04, 0.04, 0.04), base_col, metal);
+    float3 diff_col = base_col * (1.0 - metal);
+
+    // baked irradiance + its gradient-derived dominant direction
+    float3 E   = lightmap.rgb;
+    float lm_d = g_extra.x;                 // fixed-sun ↔ lightmap-grad
     float lm_a = g_extra.y;
     float d    = g_extra2.y;
-    float L_c = luminance(lightmap.rgb);
+    float L_c = luminance(E);
     float L_r = luminance(tex2D(samplerLightmap, uv_lm + float2(d, 0)).rgb);
     float L_u = luminance(tex2D(samplerLightmap, uv_lm + float2(0, d)).rgb);
-    float2 grad = float2(L_r - L_c, L_u - L_c) * lm_a;
-    float3 sun_dyn = normalize(float3(grad, 1.0));
+    float3 sun_dyn = normalize(float3(float2(L_r - L_c, L_u - L_c) * lm_a, 1.0));
     float3 L = normalize(lerp(g_sun.xyz, sun_dyn, lm_d));
+    float3 V = float3(0.0, 0.0, 1.0);       // tangent-space view (ps_2_b)
+    float3 H = normalize(L + V);
 
-    // ps_2_0: fixed face-on view direction in tangent space (no VPOS)
-    float3 V = float3(0.0, 0.0, 1.0);
+    float NdotL = saturate(dot(N, L));
+    float NdotV = saturate(dot(N, V)) + 1e-4;
+    float NdotH = saturate(dot(N, H));
+    float VdotH = saturate(dot(V, H));
 
-    // --- Lambertian diffuse ---
-    float NdotL = saturate(dot(n_ts, L));
-    float diff  = lerp(g_params.y, g_params.z, NdotL);
+    // GGX specular: D (Trowbridge-Reitz), G (Schlick-GGX), F (Schlick)
+    float a   = rough * rough;
+    float a2  = a * a;
+    float dnm = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    float D   = a2 / max(PI * dnm * dnm, 1e-5);
+    float kg  = a * 0.5;
+    float Gv  = NdotV / (NdotV * (1.0 - kg) + kg);
+    float Gl  = NdotL / (NdotL * (1.0 - kg) + kg);
+    float G   = Gv * Gl;
+    float3 Fr = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+    float3 spec = (D * G) * Fr / max(4.0 * NdotV * NdotL, 1e-3);
 
-    // --- Half-vector specular, modulated by lightmap + NdotL ---
-    float3 H    = normalize(L + V);
-    float NdotH = saturate(dot(n_ts, H));
-    float spec  = pow(NdotH, max(1.0, g_extra.w)) * g_extra.z;
-    float3 spec_color = lightmap.rgb * spec * NdotL;
+    // ENERGY FIX (v0.9.1): the baked lightmap E is already-INTEGRATED
+    // diffuse irradiance for the macro surface, NOT a punctual radiance.
+    // So the base diffuse is albedo*E (≈ the vanilla albedo*lightmap
+    // brightness — energy-preserving, not dark). The normal map only
+    // adds a gentle DETAIL modulation around that — never a full Lambert
+    // that crushes to black. Specular GGX is added on top, lit by E.
+    float ndl = dot(N, L);
+    float detail_mod = lerp(0.55, 1.35, saturate(0.5 + 0.5 * ndl));
+    float3 diffuse  = diff_col * E * detail_mod;
+    float3 specular = spec * E * saturate(ndl);      // spec = D*G*F already
 
-    // --- Fresnel rim, modulated by lightmap ---
-    float NdotV = saturate(dot(n_ts, V));
-    float rim   = pow(1.0 - NdotV, 3.0) * g_extra2.x;
-    float3 rim_color = lightmap.rgb * rim;
+    float amb_amt = g_extra2.x;                      // "Ambient" slider
+    float3 color = (diffuse + specular) * ao
+                 + diff_col * E * amb_amt * ao;      // IBL fill from lightmap
+    color += base_col * emis * pbr_k * 2.0;          // self-illum neon
+    color *= lerp(vcol_eff, float3(1,1,1), 0.5);     // mild vcol tint
 
-    // --- Compose: vanilla colour modulated by diff + alpha-scaled highlights ---
-    float a = vanilla_a;
-    float3 lit_rgb = vanilla_rgb * diff + (spec_color + rim_color) * a;
+    // exposure + ACES filmic tonemap
+    float expo = max(g_params.z, 0.05);              // "Exposure" slider
+    float gcc  = (cc_override >= 0.0) ? cc : 1.0;
+    color *= expo * gcc;
+    color = (color * (2.51 * color + 0.03)) /
+            (color * (2.43 * color + 0.59) + 0.14);  // ACES approx
 
     float mode = g_params.w;
     if (mode > 0.5 && mode < 1.5) return float4(n_raw * 0.5 + 0.5, 1.0);
     if (mode > 1.5 && mode < 2.5) return float4(NdotL.xxx, 1.0);
     if (mode > 2.5)                return albedo;
-    return float4(saturate(lit_rgb), a);
+    return float4(saturate(color), vanilla_a);
 }
 )hlsl";
 
 // CRC list of game pixel shaders we substitute. They all happen to share
 // the same 7-instruction body, so one replacement covers them all.
-constexpr uint32_t MESH_PS_CRC = 0x96f566cbu;   // legacy alias, still used in dump filter
+constexpr uint32_t MESH_PS_CRC    = 0x96f566cbu; // NPCs / items / weapons
+constexpr uint32_t OVERLAY_PS_CRC = 0xeb1b9a91u; // cursor / damage flash
+
+// v0.9.1: mesh.ps/overlay.ps substitution is OPT-IN via env var. History
+// (v0.7) said substituting mesh.ps triggers DXVK descriptor isolation
+// that grays the lightmap on world.ps too. The v0.9 architecture differs;
+// this lets the in-game test decide WITHOUT regressing the working
+// world path by default. Launch with NEOCRON_SUBSTITUTE_MESH=1 to A/B.
+inline bool subst_extra() {
+    static const bool v = [] {
+        const char* e = std::getenv("NEOCRON_SUBSTITUTE_MESH");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
+inline bool is_subst_target(uint32_t c) {
+    for (uint32_t k : GAME_PS_CRCS) if (c == k) return true;
+    // ONLY mesh.ps under the opt-in. overlay.ps (cursor/damage-flash)
+    // is a 2D shader with a different I/O signature than our
+    // Cook-Torrance replacement (no lightmap/TEXCOORD1) — substituting
+    // it makes an invalid pipeline and crashes the D3D device (exit 5).
+    if (subst_extra() && c == MESH_PS_CRC) return true;
+    return false;
+}
 
 // ── CRC32 ────────────────────────────────────────────────────────────
 uint32_t crc32(const uint8_t* data, size_t len) {
@@ -339,6 +436,12 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(
 HMODULE        g_d3dc        = nullptr;
 PFN_D3DCompile g_D3DCompile  = nullptr;
 std::vector<uint8_t> g_unified_bytecode;
+// v0.9.7: world.ps and mesh.ps each get their OWN replacement-bytecode
+// buffer (identical content, distinct allocation/pointer). Sharing one
+// `desc->code` pointer across two different game pipelines confused
+// ReShade/DXVK pipeline-state keying → descriptor isolation crash when
+// both coexist. Distinct pointers let DXVK isolate them.
+std::vector<uint8_t> g_mesh_bytecode;
 std::atomic<uint64_t> g_replacements_done{0};
 
 bool compile_one(const char* hlsl, const char* tag, std::vector<uint8_t>& out) {
@@ -392,7 +495,12 @@ bool compile_replacement() {
     }
     g_D3DCompile = (PFN_D3DCompile)GetProcAddress(g_d3dc, "D3DCompile");
     if (!g_D3DCompile) return false;
-    return compile_one(UNIFIED_PS_HLSL, "unified", g_unified_bytecode);
+    if (!compile_one(UNIFIED_PS_HLSL, "unified", g_unified_bytecode))
+        return false;
+    // independent compile → independent DXBC object/pointer for mesh.ps
+    compile_one(UNIFIED_PS_HLSL, "unified-mesh", g_mesh_bytecode);
+    if (g_mesh_bytecode.empty()) g_mesh_bytecode = g_unified_bytecode;
+    return true;
 }
 
 // ── default normal map (loaded once at first present) ────────────────
@@ -469,15 +577,31 @@ bool load_default_normal(IDirect3DDevice9* dev) {
 //   cache:  uint64_t hash      → IDirect3DTexture9*  (lazy on first draw use)
 
 std::mutex  g_index_mu;
-// Map value is the FULL relative path (corpus_root prepended at load time),
-// so get_or_load_normal doesn't need to know which index it came from.
-std::unordered_map<uint64_t, std::string> g_hash_to_path;
+// v0.8: each hash maps to a PBR triplet (albedo/normal/orme), full paths
+// (corpus_root prepended at load time). Legacy 2-token lines (stock
+// normal-only index) leave albedo/orme empty — handled gracefully.
+struct PbrPaths { std::string albedo, normal, orme; };
+std::unordered_map<uint64_t, PbrPaths> g_hash_to_path;
 
 std::mutex  g_resource_mu;
 std::unordered_map<uint64_t, uint64_t>    g_resource_to_hash;
 
+// v0.8: cache the whole PBR triplet per hash. A hash with an index
+// entry but a failed/absent normal is still a cached "no-op" (all null).
+struct PbrTex { IDirect3DTexture9 *albedo, *normal, *orme; };
 std::mutex  g_normal_cache_mu;
-std::unordered_map<uint64_t, IDirect3DTexture9*> g_normal_cache;
+std::unordered_map<uint64_t, PbrTex> g_normal_cache;
+// v0.9.6: textures evicted from the cache are NOT Released on the draw
+// thread (they may still be bound / in GPU flight, and the draw thread
+// must not stall on D3D destruction) — they're queued and freed at the
+// frame boundary in on_present, when no draw references them.
+std::mutex  g_pending_mu;
+std::vector<IDirect3DTexture9*> g_pending_release;
+inline void defer_release(IDirect3DTexture9* t) {
+    if (!t) return;
+    std::lock_guard<std::mutex> g(g_pending_mu);
+    g_pending_release.push_back(t);
+}
 std::atomic<uint64_t> g_lazy_loaded{0};
 std::atomic<uint64_t> g_index_hits{0};
 std::atomic<uint64_t> g_index_misses{0};
@@ -498,20 +622,29 @@ std::pair<size_t, size_t> load_one_index(const char* path, const char* corpus_ro
     if (!f) return { 0, 0 };
 
     size_t loaded = 0, kept = 0;
-    char line[1100];
+    char line[1600];
+    auto fix = [&](std::string s) {
+        if (s.empty()) return s;
+        std::string full = std::string(corpus_root) + s;
+        for (auto& c : full) if (c == '/') c = '\\';
+        return full;
+    };
     while (std::fgets(line, sizeof(line), f)) {
-        char hex[24] = {0};
-        char rel[1024] = {0};
-        if (std::sscanf(line, "%23s %1023[^\r\n]", hex, rel) != 2) continue;
+        char hex[24] = {0}, a[512] = {0}, n[512] = {0}, o[512] = {0};
+        int nf = std::sscanf(line, "%23s %511s %511s %511s", hex, a, n, o);
+        if (nf < 2) continue;
         char* endp = nullptr;
         uint64_t h = std::strtoull(hex, &endp, 16);
         if (!h || endp == hex) continue;
         ++loaded;
+        PbrPaths p;
+        if (nf >= 4) {                       // v0.8 triplet line
+            p.albedo = fix(a); p.normal = fix(n); p.orme = fix(o);
+        } else {                              // legacy 2-token: normal only
+            p.normal = fix(a);
+        }
         // Insert only if hash isn't already present (preserves precedence).
-        std::string full = std::string(corpus_root) + rel;
-        // Normalize separators to backslash for Win32 / Wine.
-        for (auto& c : full) if (c == '/') c = '\\';
-        if (g_hash_to_path.emplace(h, std::move(full)).second) ++kept;
+        if (g_hash_to_path.emplace(h, std::move(p)).second) ++kept;
     }
     std::fclose(f);
     return { loaded, kept };
@@ -554,102 +687,98 @@ bool load_texture_index() {
     return true;
 }
 
-const std::string* lookup_normal_path(uint64_t hash) {
+const PbrPaths* lookup_normal_path(uint64_t hash) {
     std::lock_guard<std::mutex> g(g_index_mu);
     auto it = g_hash_to_path.find(hash);
     return it != g_hash_to_path.end() ? &it->second : nullptr;
 }
 
-// Lazy load a normal map for the given hash. Returns nullptr if not in
-// index, file missing, or D3D9 upload failed (also caches the miss).
-IDirect3DTexture9* get_or_load_normal(IDirect3DDevice9* dev, uint64_t hash) {
-    {
-        std::lock_guard<std::mutex> g(g_normal_cache_mu);
-        auto it = g_normal_cache.find(hash);
-        if (it != g_normal_cache.end()) return it->second;   // may be nullptr (cached miss)
-    }
-
-    const std::string* rel = lookup_normal_path(hash);
-    if (!rel) {
-        std::lock_guard<std::mutex> g(g_normal_cache_mu);
-        g_normal_cache.emplace(hash, nullptr);
-        return nullptr;
-    }
-
-    // Index entries are full paths (corpus root prepended at load time +
-    // separators normalized). Use as-is.
-    const std::string& full = *rel;
-
+// PNG (RGBA) -> D3DFMT_A8R8G8B8 managed texture. nullptr on any failure
+// or empty path. Caller owns the returned ref.
+IDirect3DTexture9* load_png_d3d9(IDirect3DDevice9* dev,
+                                 const std::string& full, uint64_t hash) {
+    if (full.empty()) return nullptr;
     int w = 0, h = 0, ch = 0;
     unsigned char* px = stbi_load(full.c_str(), &w, &h, &ch, 4);
     if (!px) {
-        char buf[400];
+        char buf[420];
         std::snprintf(buf, sizeof(buf),
-            "renodx-engine: stbi_load FAILED for normal %s (hash %016llx): %s",
+            "renodx-engine: stbi_load FAILED %s (hash %016llx): %s",
             full.c_str(), (unsigned long long)hash, stbi_failure_reason());
         reshade::log::message(reshade::log::level::warning, buf);
-        std::lock_guard<std::mutex> g(g_normal_cache_mu);
-        g_normal_cache.emplace(hash, nullptr);
         return nullptr;
     }
-
     IDirect3DTexture9* tex = nullptr;
     HRESULT hr = dev->CreateTexture((UINT)w, (UINT)h, 1, 0,
         D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr);
-    if (FAILED(hr) || !tex) {
-        stbi_image_free(px);
-        std::lock_guard<std::mutex> g(g_normal_cache_mu);
-        g_normal_cache.emplace(hash, nullptr);
-        return nullptr;
-    }
-
+    if (FAILED(hr) || !tex) { stbi_image_free(px); return nullptr; }
     D3DLOCKED_RECT lr;
     if (FAILED(tex->LockRect(0, &lr, nullptr, 0))) {
-        tex->Release();
-        stbi_image_free(px);
-        std::lock_guard<std::mutex> g(g_normal_cache_mu);
-        g_normal_cache.emplace(hash, nullptr);
-        return nullptr;
+        tex->Release(); stbi_image_free(px); return nullptr;
     }
-    // RGBA → BGRA (D3DFMT_A8R8G8B8 byte order in memory)
-    for (int y = 0; y < h; ++y) {
+    for (int y = 0; y < h; ++y) {                  // RGBA -> BGRA
         uint8_t* dst = (uint8_t*)lr.pBits + y * lr.Pitch;
-        const unsigned char* src = px + y * w * 4;
+        const unsigned char* s = px + y * w * 4;
         for (int x = 0; x < w; ++x) {
-            dst[x*4 + 0] = src[x*4 + 2];
-            dst[x*4 + 1] = src[x*4 + 1];
-            dst[x*4 + 2] = src[x*4 + 0];
-            dst[x*4 + 3] = src[x*4 + 3];
+            dst[x*4+0] = s[x*4+2]; dst[x*4+1] = s[x*4+1];
+            dst[x*4+2] = s[x*4+0]; dst[x*4+3] = s[x*4+3];
         }
     }
     tex->UnlockRect(0);
     stbi_image_free(px);
+    return tex;
+}
 
+// Lazy-load the PBR triplet for a hash. Returns the PbrTex BY VALUE
+// (v0.9.6): the previous `const PbrTex*` pointed INTO g_normal_cache —
+// a concurrent insert here rehashes the unordered_map and invalidates
+// every such pointer, so the draw thread used freed memory (textbook
+// UAF; mesh.ps's draw frequency made it fire, +seh latency hid it).
+// Returning a value copies the 3 raw texture pointers, which stay valid
+// because eviction now DEFERS Release to the frame boundary.
+PbrTex get_or_load_pbr(IDirect3DDevice9* dev, uint64_t hash) {
     {
         std::lock_guard<std::mutex> g(g_normal_cache_mu);
-        // Crude cap: if too many entries, evict an arbitrary live one.
-        // LRU not worth the complexity for a 256-entry budget on a 2004 game.
-        if (g_normal_cache.size() >= NORMAL_CACHE_MAX) {
-            for (auto it = g_normal_cache.begin(); it != g_normal_cache.end(); ++it) {
-                if (it->second) {
-                    it->second->Release();
-                    g_normal_cache.erase(it);
-                    break;
-                }
+        auto it = g_normal_cache.find(hash);
+        if (it != g_normal_cache.end()) return it->second;
+    }
+    const PbrPaths* rel = lookup_normal_path(hash);
+    PbrTex t{ nullptr, nullptr, nullptr };
+    if (rel) {
+        t.albedo = load_png_d3d9(dev, rel->albedo, hash);
+        t.normal = load_png_d3d9(dev, rel->normal, hash);
+        t.orme   = load_png_d3d9(dev, rel->orme,   hash);
+    }
+    std::lock_guard<std::mutex> g(g_normal_cache_mu);
+    auto it = g_normal_cache.find(hash);
+    if (it != g_normal_cache.end()) {              // raced — drop ours
+        defer_release(t.albedo); defer_release(t.normal); defer_release(t.orme);
+        return it->second;
+    }
+    if (g_normal_cache.size() >= NORMAL_CACHE_MAX) {
+        for (auto e = g_normal_cache.begin(); e != g_normal_cache.end(); ++e) {
+            if (e->second.albedo || e->second.normal || e->second.orme) {
+                defer_release(e->second.albedo);
+                defer_release(e->second.normal);
+                defer_release(e->second.orme);
+                g_normal_cache.erase(e);
+                break;
             }
         }
-        g_normal_cache[hash] = tex;
     }
-
-    uint64_t n = g_lazy_loaded.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n <= 8 || (n % 50) == 0) {
-        char buf[400];
-        std::snprintf(buf, sizeof(buf),
-            "renodx-engine: lazy-loaded normal #%llu hash=%016llx %dx%d → %s",
-            (unsigned long long)n, (unsigned long long)hash, w, h, rel->c_str());
-        reshade::log::message(reshade::log::level::info, buf);
+    g_normal_cache[hash] = t;
+    if (rel && (t.albedo || t.normal || t.orme)) {
+        uint64_t n = g_lazy_loaded.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || (n % 50) == 0) {
+            char buf[420];
+            std::snprintf(buf, sizeof(buf),
+                "renodx-engine: lazy-loaded PBR #%llu hash=%016llx "
+                "alb=%d n=%d orme=%d", (unsigned long long)n,
+                (unsigned long long)hash, !!t.albedo, !!t.normal, !!t.orme);
+            reshade::log::message(reshade::log::level::info, buf);
+        }
     }
-    return tex;
+    return t;
 }
 
 // ── pipeline tracking ────────────────────────────────────────────────
@@ -660,6 +789,7 @@ std::unordered_set<uint32_t>           g_dumped_ps;
 
 thread_local bool     t_z_enabled = true;
 thread_local bool     t_using_substituted_world_ps = false;
+thread_local uint32_t t_cur_ps_crc = 0;   // original CRC of bound (substituted) PS
 
 // ── ReShade callbacks ────────────────────────────────────────────────
 
@@ -676,12 +806,12 @@ bool on_create_pipeline(reshade::api::device*,
         if (!desc || !desc->code || !desc->code_size) continue;
         uint32_t c = crc32(static_cast<const uint8_t*>(desc->code), desc->code_size);
 
-        bool is_game_ps = false;
-        for (uint32_t known : GAME_PS_CRCS) if (c == known) { is_game_ps = true; break; }
-        if (!is_game_ps) continue;
+        if (!is_subst_target(c)) continue;
 
-        desc->code      = g_unified_bytecode.data();
-        desc->code_size = g_unified_bytecode.size();
+        // distinct buffer per game pipeline (v0.9.7)
+        auto& bc = (c == MESH_PS_CRC) ? g_mesh_bytecode : g_unified_bytecode;
+        desc->code      = bc.data();
+        desc->code_size = bc.size();
         modified = true;
         uint64_t n = g_replacements_done.fetch_add(1, std::memory_order_relaxed) + 1;
         char buf[160];
@@ -712,14 +842,23 @@ void on_init_pipeline(reshade::api::device*,
         if (!desc || !desc->code || !desc->code_size) continue;
         uint32_t c = crc32(static_cast<const uint8_t*>(desc->code), desc->code_size);
         std::lock_guard<std::mutex> g(g_pipe_mu);
-        g_ps_pipeline_to_crc[pipeline.handle] = c;
-        if (!g_unified_bytecode.empty() &&
-            desc->code == g_unified_bytecode.data() &&
-            desc->code_size == g_unified_bytecode.size()) {
+        // desc->code here is ALREADY our replacement (create_pipeline ran
+        // first). Identify world vs mesh by which distinct buffer backs
+        // it — this is the reliable mesh tag the crc could never give
+        // (both replacements share content → same crc).
+        bool is_world_repl = (desc->code == g_unified_bytecode.data());
+        bool is_mesh_repl  = (!g_mesh_bytecode.empty() &&
+                              desc->code == g_mesh_bytecode.data());
+        if (is_mesh_repl) {
+            g_ps_pipeline_to_crc[pipeline.handle] = MESH_PS_CRC;
             g_substituted_ps_pipelines.insert(pipeline.handle);
+        } else if (is_world_repl) {
+            g_ps_pipeline_to_crc[pipeline.handle] = WORLD_PS_CRC;
+            g_substituted_ps_pipelines.insert(pipeline.handle);
+        } else {
+            g_ps_pipeline_to_crc[pipeline.handle] = c;
         }
-        bool is_known = false;
-        for (uint32_t known : GAME_PS_CRCS) if (c == known) is_known = true;
+        bool is_known = is_subst_target(c) || is_world_repl || is_mesh_repl;
         if (g_dumped_ps.insert(c).second && !is_known)
             dump_ps_bytecode(c, desc->code, desc->code_size);
     }
@@ -732,6 +871,8 @@ void on_bind_pipeline(reshade::api::command_list*,
         return;
     std::lock_guard<std::mutex> g(g_pipe_mu);
     t_using_substituted_world_ps = g_substituted_ps_pipelines.count(pipeline.handle) > 0;
+    auto it = g_ps_pipeline_to_crc.find(pipeline.handle);
+    t_cur_ps_crc = (it != g_ps_pipeline_to_crc.end()) ? it->second : 0;
 }
 
 void on_bind_pipeline_states(reshade::api::command_list*,
@@ -854,7 +995,7 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
     // Per-tex lookup only for 3D world geometry (z-test on). HUD draws
     // (z-test off) skip the lookup AND the normal binding, but we STILL
     // push BUMP_ON=0 constants so the shader takes the vanilla path.
-    IDirect3DTexture9* normal = nullptr;
+    PbrTex pbr{ nullptr, nullptr, nullptr };   // v0.9.6: by value (no map ptr)
     if (t_z_enabled) {
         IDirect3DBaseTexture9* albedo = nullptr;
         dev->GetTexture(0, &albedo);
@@ -881,18 +1022,35 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
                         g_index_misses.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            if (hash) normal = get_or_load_normal(dev, hash);
+            if (hash) pbr = get_or_load_pbr(dev, hash);
             albedo->Release();
         }
     }
 
-    bool per_tex = normal != nullptr;
+    // per_tex = at least the normal resolved. albedo (s0) and orme (s3)
+    // are bound when present; the shader senses each via g_extra2.zw.
+    bool per_tex = pbr.normal != nullptr;
+    auto bind = [&](UINT samp, IDirect3DTexture9* t) {
+        dev->SetTexture(samp, t);
+        dev->SetSamplerState(samp, D3DSAMP_ADDRESSU,  D3DTADDRESS_WRAP);
+        dev->SetSamplerState(samp, D3DSAMP_ADDRESSV,  D3DTADDRESS_WRAP);
+        dev->SetSamplerState(samp, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(samp, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(samp, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    };
+    // Option A: mesh.ps is an ultra-high-frequency pipeline. Rebinding
+    // the game's ACTIVE s0 (and s3) on it + DXVK descriptor isolation
+    // hard-crashes (v0.9.x test). For mesh.ps draws, ONLY bind the
+    // normal at s2 (a sampler the game never uses — the v0.7-safe slot);
+    // never touch s0/s3 and never let the shader sample the lightmap.
+    bool is_mesh = (t_cur_ps_crc == MESH_PS_CRC);
+    bool have_hd_albedo = false, have_orme = false;
     if (per_tex) {
-        dev->SetTexture(NORMAL_SAMPLER, normal);
-        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSU,  D3DTADDRESS_WRAP);
-        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_ADDRESSV,  D3DTADDRESS_WRAP);
-        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-        dev->SetSamplerState(NORMAL_SAMPLER, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        bind(NORMAL_SAMPLER, pbr.normal);
+        if (!is_mesh) {
+            if (pbr.albedo) { bind(ALBEDO_SAMPLER, pbr.albedo); have_hd_albedo = true; }
+            if (pbr.orme)   { bind(ORME_SAMPLER,   pbr.orme);   have_orme = true; }
+        }
     }
 
     // v0.5.9: force MAXMIPLEVEL=0 + no mip selection on s1.
@@ -943,7 +1101,10 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         g_light_max.load(std::memory_order_relaxed),
         (float)g_debug_mode.load(std::memory_order_relaxed)
     };
-    float sun[4]    = { SUN_X, SUN_Y, SUN_Z, per_tex ? 1.0f : 0.0f };
+    // g_sun.w: 0=not per-tex (vanilla), 1=per-tex world (full PBR),
+    //          2=per-tex mesh (normal-bump only, no lightmap/Cook-Torrance)
+    float sun_w = !per_tex ? 0.0f : (is_mesh ? 2.0f : 1.0f);
+    float sun[4]    = { SUN_X, SUN_Y, SUN_Z, sun_w };
     float extra[4]  = {
         g_lm_driven.load(),  g_lm_amp.load(),
         g_spec_strength.load(), g_spec_shiny.load()
@@ -952,7 +1113,10 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         g_rim_strength.load(), g_lm_tap.load(),
         g_screen_inv_w.load(), g_screen_inv_h.load()
     };
-    float extra3[4] = { g_normal_y_flip.load(), 0.0f, 0.0f, 0.0f };
+    float extra3[4] = { g_normal_y_flip.load(),
+                        have_orme ? 1.0f : 0.0f,
+                        g_pbr_strength.load(),
+                        have_hd_albedo ? 1.0f : 0.0f };
     float extra4[4] = {
         g_vcol_mix.load(),   g_lm_mix.load(),
         g_cc_override.load(), g_albedo_boost.load()
@@ -970,8 +1134,9 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         if (n == 1) {
             char buf[160];
             std::snprintf(buf, sizeof(buf),
-                "renodx-engine: FIRST per-texture normal bound (tex=%p)",
-                (void*)normal);
+                "renodx-engine: FIRST per-texture PBR bound "
+                "(n=%p alb=%p orme=%p)",
+                (void*)pbr.normal, (void*)pbr.albedo, (void*)pbr.orme);
             reshade::log::message(reshade::log::level::info, buf);
         }
     }
@@ -1009,25 +1174,31 @@ void on_overlay(reshade::api::effect_runtime*) {
     ImGui::Separator();
 
     if (ImGui::SliderFloat("Bump amp",  &amp,  0.5f, 15.0f, "%.1f"))  g_bump_amp.store(amp);
-    if (ImGui::SliderFloat("Light min", &lmin, 0.0f,  1.0f, "%.2f"))  g_light_min.store(lmin);
-    if (ImGui::SliderFloat("Light max", &lmax, 1.0f,  3.0f, "%.2f"))  g_light_max.store(lmax);
+    if (ImGui::SliderFloat("Exposure",  &lmax, 0.10f, 4.0f, "%.2f"))  g_light_max.store(lmax);   // v0.9 g_params.z
+    if (ImGui::SliderFloat("(unused) light_min", &lmin, 0.0f, 1.0f, "%.2f")) g_light_min.store(lmin);
 
+    // ASCII only — ImGui's default font has no em-dash glyph (renders '?')
     static const char* MODES[] = {
-        "0 — Lit (full)",
-        "1 — Raw normal RGB",
-        "2 — NdotL grayscale",
-        "3 — Albedo (per-tex only)",
-        "4 — Vanilla raw (no math)",
-        "5 — Albedo channel",
-        "6 — Lightmap channel",
-        "7 — vcol channel",
-        "8 — colorCorrection.xyz",
-        "9 — vcol after mix slider",
-        "10 — Lightmap after mix slider",
-        "11 — Lightmap @ fixed UV(0.5,0.5)",
-        "12 — Lightmap sampled with TEXCOORD0",
-        "13 — TEXCOORD1 raw (uv_lm gradient)",
-        "14 — TEXCOORD0 raw (uv gradient)",
+        "0 - Lit (full Cook-Torrance)",
+        "1 - Raw normal RGB",
+        "2 - NdotL grayscale",
+        "3 - Albedo (per-tex only)",
+        "4 - Vanilla raw (no math)",
+        "5 - Albedo channel (HD if matched)",
+        "6 - Lightmap (= irradiance)",
+        "7 - vcol channel",
+        "8 - colorCorrection.xyz",
+        "9 - vcol after mix slider",
+        "10 - Lightmap after mix slider",
+        "11 - Lightmap @ fixed UV(0.5,0.5)",
+        "12 - Lightmap sampled w/ TEXCOORD0",
+        "13 - TEXCOORD1 raw (uv_lm gradient)",
+        "14 - TEXCOORD0 raw (uv gradient)",
+        "15 - ORME R: Occlusion",
+        "16 - ORME G: Roughness",
+        "17 - ORME B: Metallic",
+        "18 - ORME A: Emissive",
+        "19 - ORME RGB (O,R,M)",
     };
     if (ImGui::Combo("Debug viz", &mode, MODES, IM_ARRAYSIZE(MODES))) g_debug_mode.store(mode);
 
@@ -1045,9 +1216,14 @@ void on_overlay(reshade::api::effect_runtime*) {
     float ss = g_spec_strength.load();
     float sh = g_spec_shiny.load();
     float rs = g_rim_strength.load();
-    if (ImGui::SliderFloat("Specular strength",  &ss, 0.0f, 2.0f,  "%.2f")) g_spec_strength.store(ss);
-    if (ImGui::SliderFloat("Specular shininess", &sh, 1.0f, 128.0f,"%.0f")) g_spec_shiny.store(sh);
-    if (ImGui::SliderFloat("Rim strength",       &rs, 0.0f, 2.0f,  "%.2f")) g_rim_strength.store(rs);
+    if (ImGui::SliderFloat("Ambient (IBL from lightmap)", &rs, 0.0f, 1.5f, "%.2f")) g_rim_strength.store(rs);  // v0.9 g_extra2.x
+    ImGui::TextDisabled("(legacy spec sliders inert under Cook-Torrance)");
+    (void)ss; (void)sh;
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("PBR (ORME: occlusion / roughness / metallic / emissive)");
+    float pbrs = g_pbr_strength.load();
+    if (ImGui::SliderFloat("PBR strength", &pbrs, 0.0f, 2.0f, "%.2f")) g_pbr_strength.store(pbrs);
 
     ImGui::Separator();
     ImGui::TextUnformatted("Vanilla formula overrides (v0.5.1 debug)");
@@ -1069,14 +1245,14 @@ void on_overlay(reshade::api::effect_runtime*) {
     if (ImGui::Button("Reset to defaults")) {
         g_bump_amp.store(4.0f);
         g_light_min.store(0.60f);
-        g_light_max.store(1.40f);
+        g_light_max.store(1.00f);    // v0.9 Exposure
         g_debug_mode.store(0);
         g_lm_driven.store(0.0f);
         g_lm_amp.store(4.0f);
         g_lm_tap.store(0.005f);
         g_spec_strength.store(0.15f);
         g_spec_shiny.store(16.0f);
-        g_rim_strength.store(0.0f);
+        g_rim_strength.store(0.35f); // v0.9 Ambient
         g_normal_y_flip.store(1.0f);
         g_vcol_mix.store(0.0f);
         g_lm_mix.store(0.0f);
@@ -1104,6 +1280,16 @@ void on_overlay(reshade::api::effect_runtime*) {
 }
 
 void on_present(reshade::api::effect_runtime* rt) {
+    // v0.9.6: free cache-evicted textures HERE — frame boundary, no draw
+    // in flight, so nothing the GPU/device still references is destroyed.
+    {
+        std::vector<IDirect3DTexture9*> drain;
+        {
+            std::lock_guard<std::mutex> g(g_pending_mu);
+            drain.swap(g_pending_release);
+        }
+        for (auto* t : drain) if (t) t->Release();
+    }
     // Lazy-load normal on the first frame after the device is fully up.
     if (!g_default_normal && rt) {
         auto* dev = reinterpret_cast<IDirect3DDevice9*>(rt->get_device()->get_native());
@@ -1164,8 +1350,14 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
             reshade::register_event<reshade::addon_event::reshade_present>(on_present);
             reshade::register_overlay("Neocron RenoDX Engine", on_overlay);
-            reshade::log::message(reshade::log::level::info,
-                "renodx-engine: m4 v0.7.0 (world.ps × 3 variants only — proper lightmap + bumps) registered");
+            {
+                char b[200];
+                std::snprintf(b, sizeof(b),
+                    "renodx-engine: v0.9.7 registered — world.ps always; "
+                    "mesh.ps substitution=%s (NEOCRON_SUBSTITUTE_MESH)",
+                    subst_extra() ? "ON" : "OFF");
+                reshade::log::message(reshade::log::level::info, b);
+            }
             log_tunables("init defaults");
             reshade::log::message(reshade::log::level::info,
                 "renodx-engine: open ReShade overlay (Home) → Add-ons tab → "
@@ -1186,7 +1378,11 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             if (g_default_normal) { g_default_normal->Release(); g_default_normal = nullptr; }
             {
                 std::lock_guard<std::mutex> g(g_normal_cache_mu);
-                for (auto& kv : g_normal_cache) if (kv.second) kv.second->Release();
+                for (auto& kv : g_normal_cache) {
+                    if (kv.second.albedo) kv.second.albedo->Release();
+                    if (kv.second.normal) kv.second.normal->Release();
+                    if (kv.second.orme)   kv.second.orme->Release();
+                }
                 g_normal_cache.clear();
             }
             if (g_d3dc) FreeLibrary(g_d3dc);
