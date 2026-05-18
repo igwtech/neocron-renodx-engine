@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.11.0] — 2026-05-17
+
+**Embedded-ID texture identification + single-file PBR containers.**
+Replaces the fragile runtime content-hash. The deployed vanilla file is
+stamped with a 32-bit id in mip-0 block-0 (`NCID` + id LE); the engine
+reads it back via LockRect (exact — immune to the >512 clamp, DXT
+re-encode nondeterminism, and byte-identical-duplicate hash collisions).
+A tagged texture is always HD-replaced at s0, so the stomped 4×4 corner
+is never displayed (zero visual cost). Each id resolves to one `.pbr`
+container (`"NCPBR\0"` + 3×u32 lens + albedo + normal + orme) decoded
+from memory — no path/stem resolution. Untagged textures keep the
+unchanged hash path (back-compat).
+
+**Fix: non-deterministic wrong textures across zone reloads.** The
+per-resource id/hash caches were keyed by `(uint64_t)GetTexture-ptr`
+but `destroy_resource` erased by ReShade's `resource.handle` (a
+different value) — a freed entry survived and a recycled allocation
+address produced a stale-id cache hit, different every zone reload. The
+id is now read fresh every bind (8 B LockRect on a POOL_MANAGED sysmem
+copy — cheap, no GPU sync); never cached by resource pointer.
+
+Corpus side (see nc2-hd-textures `pipeline/`): content-keyed ids so
+byte-identical duplicates share one container, and ORME occlusion is
+flat (tiling world geometry takes its AO from the baked lightmap, not a
+per-tile texture). Validated stable in-game.
+
 ## [0.7.0] — 2026-05-10
 
 **The world lightmap is back.** Bisecting which of the 5 substituted

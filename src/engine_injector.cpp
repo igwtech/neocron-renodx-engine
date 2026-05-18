@@ -98,6 +98,18 @@ constexpr const char* STOCK_INDEX_FILE  = "neocron_stock_index.txt";
 constexpr const char* HD_CORPUS_DIR     = "gfx_pbr\\";          // v0.8: triplet corpus (albedo/normal/orme) deployed by nc2-hd-textures
 constexpr const char* STOCK_CORPUS_DIR  = "gfx_normals_stock\\"; // legacy normal-only fallback (2-token lines)
 
+// ── idea #1+#2: embedded-ID identification + single-file triplet ──────
+// We control the deployed vanilla file, so we stamp a unique 32-bit ID
+// into the FIRST mip-0 DXT block (offset 0..8: 4B magic + 4B id LE). The
+// engine reads it back via LockRect (the header is gone post-load, but
+// block-0 bytes survive DXVK intact — same proven path as the content
+// hash). Tagged textures are ALWAYS HD-replaced at s0, so the stomped
+// 4x4 top-left corner is never displayed → zero visual cost. The ID maps
+// to ONE container file (albedo+normal+orme packed) → no path/stem
+// resolution (idea #2). Untagged textures take the unchanged hash path.
+constexpr const char* ID_INDEX_FILE     = "neocron_id_index.txt";
+constexpr unsigned char ID_MAGIC[4]     = { 'N','C','I','D' };
+
 // v0.8: 64 KiB (was 4 KiB). NC2 world textures are DXT — linear
 // block-rows, no LockRect row padding — so offline-tight == runtime
 // pitch and the proven match holds, while genuine hash collisions drop
@@ -583,8 +595,15 @@ std::mutex  g_index_mu;
 struct PbrPaths { std::string albedo, normal, orme; };
 std::unordered_map<uint64_t, PbrPaths> g_hash_to_path;
 
+// idea #1+#2: ID -> absolute path of the single .pbr triplet container.
+std::mutex g_id_mu;
+std::unordered_map<uint32_t, std::string> g_id_to_container;
+std::atomic<uint64_t> g_id_hits{0};
+
 std::mutex  g_resource_mu;
 std::unordered_map<uint64_t, uint64_t>    g_resource_to_hash;
+// handle -> embedded ID (0 = checked, untagged; absent = not yet checked)
+std::unordered_map<uint64_t, uint32_t>    g_resource_to_id;
 
 // v0.8: cache the whole PBR triplet per hash. A hash with an index
 // entry but a failed/absent normal is still a cached "no-op" (all null).
@@ -607,10 +626,37 @@ std::atomic<uint64_t> g_index_hits{0};
 std::atomic<uint64_t> g_index_misses{0};
 
 inline uint64_t hash_pixels(const void* data, size_t avail, uint32_t w, uint32_t h) {
-    if (!data || avail == 0) return 0;
-    size_t take = avail < HASH_SAMPLE_BYTES ? avail : HASH_SAMPLE_BYTES;
-    uint32_t crc = crc32(static_cast<const uint8_t*>(data), take);
+    if (!data || avail == 0) return 0;                 // rare non-D3D9 path
+    uint32_t crc = crc32(static_cast<const uint8_t*>(data), avail);
     return ((uint64_t)crc << 32) | ((uint64_t)(w & 0xFFFFu) << 16) | (uint64_t)(h & 0xFFFFu);
+}
+
+// mip-0 (rowBytes, rows) for a D3DFORMAT — matches the offline
+// _mip0_size() in build_pbr_index.py. DXT row = a row of 4x4 blocks.
+inline void format_mip0(uint32_t fmt, uint32_t w, uint32_t h,
+                        size_t& row_bytes, size_t& rows) {
+    auto bw = [](uint32_t v){ return v < 1 ? 1u : v; };
+    if (fmt == 0x31545844u) {                          // DXT1 (BC1) 8B/block
+        row_bytes = bw((w + 3) / 4) * 8;
+        rows      = bw((h + 3) / 4);
+    } else if (fmt == 0x32545844u || fmt == 0x33545844u ||
+               fmt == 0x34545844u || fmt == 0x35545844u) {  // DXT2-5 16B
+        row_bytes = bw((w + 3) / 4) * 16;
+        rows      = bw((h + 3) / 4);
+    } else {
+        uint32_t bpp;
+        switch (fmt) {
+            case 21: case 22: case 32: case 33:
+            case 31: case 35:                bpp = 4; break;  // *8R8G8B8 etc
+            case 20:                         bpp = 3; break;  // R8G8B8
+            case 23: case 24: case 25:
+            case 26: case 29: case 30: case 51: bpp = 2; break;
+            case 28: case 41: case 50:       bpp = 1; break;  // A8/P8/L8
+            default:                         bpp = 4; break;
+        }
+        row_bytes = (size_t)w * bpp;
+        rows      = h;
+    }
 }
 
 // Load one index file and prepend the given corpus root to each entry's
@@ -650,6 +696,30 @@ std::pair<size_t, size_t> load_one_index(const char* path, const char* corpus_ro
     return { loaded, kept };
 }
 
+// idea #1+#2 index: lines "<id_hex8> <container_relpath>". Container path
+// is corpus-root-relative (same HD root the triplet index uses).
+size_t load_id_index(const char* path, const char* corpus_root) {
+    FILE* f = std::fopen(path, "r");
+    if (!f) return 0;
+    std::lock_guard<std::mutex> g(g_id_mu);
+    g_id_to_container.clear();
+    size_t n = 0;
+    char line[1200];
+    while (std::fgets(line, sizeof(line), f)) {
+        char hex[24] = {0}, rel[1024] = {0};
+        if (std::sscanf(line, "%23s %1023s", hex, rel) < 2) continue;
+        char* endp = nullptr;
+        unsigned long id = std::strtoul(hex, &endp, 16);
+        if (!id || endp == hex) continue;
+        std::string full = std::string(corpus_root) + rel;
+        for (auto& c : full) if (c == '/') c = '\\';
+        if (g_id_to_container.emplace((uint32_t)id, std::move(full)).second)
+            ++n;
+    }
+    std::fclose(f);
+    return n;
+}
+
 bool load_texture_index() {
     std::lock_guard<std::mutex> g(g_index_mu);
     g_hash_to_path.clear();
@@ -668,17 +738,19 @@ bool load_texture_index() {
 
     auto [hd_loaded, hd_kept]       = load_one_index(HD_INDEX_FILE,    hd_root.c_str());
     auto [stock_loaded, stock_kept] = load_one_index(STOCK_INDEX_FILE, stock_root.c_str());
+    size_t id_kept = load_id_index(ID_INDEX_FILE, hd_root.c_str());
 
-    char buf[400];
+    char buf[460];
     std::snprintf(buf, sizeof(buf),
         "renodx-engine: indexes loaded — HD %zu entries (root='%s'), "
-        "stock %zu loaded / %zu kept (root='%s'); total map size = %zu",
+        "stock %zu loaded / %zu kept (root='%s'); ID-tagged %zu; "
+        "total map size = %zu",
         hd_kept, hd_root.c_str(),
         stock_loaded, stock_kept, stock_root.c_str(),
-        g_hash_to_path.size());
+        id_kept, g_hash_to_path.size());
     reshade::log::message(reshade::log::level::info, buf);
 
-    if (g_hash_to_path.empty()) {
+    if (g_hash_to_path.empty() && g_id_to_container.empty()) {
         reshade::log::message(reshade::log::level::warning,
             "renodx-engine: NO indexes found — per-texture lookup disabled, "
             "all surfaces will fall back to brick default normal");
@@ -693,21 +765,9 @@ const PbrPaths* lookup_normal_path(uint64_t hash) {
     return it != g_hash_to_path.end() ? &it->second : nullptr;
 }
 
-// PNG (RGBA) -> D3DFMT_A8R8G8B8 managed texture. nullptr on any failure
-// or empty path. Caller owns the returned ref.
-IDirect3DTexture9* load_png_d3d9(IDirect3DDevice9* dev,
-                                 const std::string& full, uint64_t hash) {
-    if (full.empty()) return nullptr;
-    int w = 0, h = 0, ch = 0;
-    unsigned char* px = stbi_load(full.c_str(), &w, &h, &ch, 4);
-    if (!px) {
-        char buf[420];
-        std::snprintf(buf, sizeof(buf),
-            "renodx-engine: stbi_load FAILED %s (hash %016llx): %s",
-            full.c_str(), (unsigned long long)hash, stbi_failure_reason());
-        reshade::log::message(reshade::log::level::warning, buf);
-        return nullptr;
-    }
+// RGBA8 pixels -> D3DFMT_A8R8G8B8 managed texture (RGBA->BGRA). Frees px.
+IDirect3DTexture9* tex_from_rgba(IDirect3DDevice9* dev,
+                                 unsigned char* px, int w, int h) {
     IDirect3DTexture9* tex = nullptr;
     HRESULT hr = dev->CreateTexture((UINT)w, (UINT)h, 1, 0,
         D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr);
@@ -727,6 +787,119 @@ IDirect3DTexture9* load_png_d3d9(IDirect3DDevice9* dev,
     tex->UnlockRect(0);
     stbi_image_free(px);
     return tex;
+}
+
+// PNG (RGBA) -> D3DFMT_A8R8G8B8 managed texture. nullptr on any failure
+// or empty path. Caller owns the returned ref.
+IDirect3DTexture9* load_png_d3d9(IDirect3DDevice9* dev,
+                                 const std::string& full, uint64_t hash) {
+    if (full.empty()) return nullptr;
+    int w = 0, h = 0, ch = 0;
+    unsigned char* px = stbi_load(full.c_str(), &w, &h, &ch, 4);
+    if (!px) {
+        char buf[420];
+        std::snprintf(buf, sizeof(buf),
+            "renodx-engine: stbi_load FAILED %s (hash %016llx): %s",
+            full.c_str(), (unsigned long long)hash, stbi_failure_reason());
+        reshade::log::message(reshade::log::level::warning, buf);
+        return nullptr;
+    }
+    return tex_from_rgba(dev, px, w, h);
+}
+
+// idea #1: read the 32-bit ID stamped into mip-0 block-0. Returns 0 if
+// the texture isn't tagged (natural content). Locks exactly 8 bytes.
+uint32_t read_embedded_id(IDirect3DBaseTexture9* base) {
+    if (!base) return 0;
+    IDirect3DTexture9* t = nullptr;
+    if (FAILED(base->QueryInterface(__uuidof(IDirect3DTexture9),
+        (void**)&t)) || !t) return 0;
+    uint32_t id = 0;
+    D3DLOCKED_RECT lr{};
+    if (SUCCEEDED(t->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))
+        && lr.pBits) {
+        const unsigned char* p = (const unsigned char*)lr.pBits;
+        if (p[0]==ID_MAGIC[0] && p[1]==ID_MAGIC[1] &&
+            p[2]==ID_MAGIC[2] && p[3]==ID_MAGIC[3])
+            id = (uint32_t)p[4] | ((uint32_t)p[5]<<8) |
+                 ((uint32_t)p[6]<<16) | ((uint32_t)p[7]<<24);
+        t->UnlockRect(0);
+    }
+    t->Release();
+    return id;
+}
+
+// idea #2: one .pbr container = "NCPBR\0" v1 + 3 u32 LE lengths +
+// albedo(jpg) + normal(png) + orme(png). Decoded via stb from memory.
+PbrTex load_pbr_container(IDirect3DDevice9* dev, const std::string& full) {
+    PbrTex t{ nullptr, nullptr, nullptr };
+    FILE* f = std::fopen(full.c_str(), "rb");
+    if (!f) return t;
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (sz < 20) { std::fclose(f); return t; }
+    std::vector<unsigned char> buf((size_t)sz);
+    size_t rd = std::fread(buf.data(), 1, (size_t)sz, f);
+    std::fclose(f);
+    if (rd != (size_t)sz) return t;
+    if (std::memcmp(buf.data(), "NCPBR", 5) != 0) return t;
+    auto u32 = [&](size_t o){ return (uint32_t)buf[o] |
+        ((uint32_t)buf[o+1]<<8) | ((uint32_t)buf[o+2]<<16) |
+        ((uint32_t)buf[o+3]<<24); };
+    uint32_t la = u32(8), ln = u32(12), lo = u32(16);
+    size_t off = 20;
+    if (off + (size_t)la + ln + lo > (size_t)sz) return t;
+    auto decode = [&](size_t o, uint32_t len) -> IDirect3DTexture9* {
+        if (!len) return nullptr;
+        int w=0,h=0,ch=0;
+        unsigned char* px = stbi_load_from_memory(buf.data()+o, (int)len,
+                                                  &w,&h,&ch,4);
+        return px ? tex_from_rgba(dev, px, w, h) : nullptr;
+    };
+    t.albedo = decode(off,            la);
+    t.normal = decode(off+la,         ln);
+    t.orme   = decode(off+la+ln,      lo);
+    return t;
+}
+
+// ID-keyed cache, mirrors get_or_load_pbr's defer-release discipline.
+std::unordered_map<uint32_t, PbrTex> g_id_cache;
+PbrTex get_or_load_pbr_by_id(IDirect3DDevice9* dev, uint32_t id) {
+    {
+        std::lock_guard<std::mutex> g(g_normal_cache_mu);
+        auto it = g_id_cache.find(id);
+        if (it != g_id_cache.end()) return it->second;
+    }
+    std::string path;
+    {
+        std::lock_guard<std::mutex> g(g_id_mu);
+        auto it = g_id_to_container.find(id);
+        if (it != g_id_to_container.end()) path = it->second;
+    }
+    PbrTex t{ nullptr, nullptr, nullptr };
+    if (!path.empty()) t = load_pbr_container(dev, path);
+
+    std::lock_guard<std::mutex> g(g_normal_cache_mu);
+    auto it = g_id_cache.find(id);
+    if (it != g_id_cache.end()) {
+        defer_release(t.albedo); defer_release(t.normal);
+        defer_release(t.orme);
+        return it->second;
+    }
+    g_id_cache[id] = t;
+    if (!path.empty() && (t.albedo || t.normal || t.orme)) {
+        uint64_t n = g_id_hits.fetch_add(1, std::memory_order_relaxed)+1;
+        if (n <= 8 || (n % 50) == 0) {
+            char b[480];
+            std::snprintf(b, sizeof(b),
+                "renodx-engine: ID-tagged #%llu id=0x%08x alb=%d n=%d "
+                "orme=%d (%s)", (unsigned long long)n, id,
+                !!t.albedo, !!t.normal, !!t.orme, path.c_str());
+            reshade::log::message(reshade::log::level::info, b);
+        }
+    }
+    return t;
 }
 
 // Lazy-load the PBR triplet for a hash. Returns the PbrTex BY VALUE
@@ -955,10 +1128,27 @@ uint64_t hash_d3d9_texture(IDirect3DBaseTexture9* base) {
     D3DSURFACE_DESC desc{};
     if (SUCCEEDED(tex2d->GetLevelDesc(0, &desc))) {
         D3DLOCKED_RECT lr{};
-        if (SUCCEEDED(tex2d->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) {
-            size_t avail = (size_t)lr.Pitch * desc.Height;
-            if (lr.pBits && avail > 0)
-                hash = hash_pixels(lr.pBits, avail, desc.Width, desc.Height);
+        if (SUCCEEDED(tex2d->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))
+            && lr.pBits && lr.Pitch > 0 && desc.Width && desc.Height) {
+            // v0.10: FULL mip-0 content CRC, pitch-stripped → tight,
+            // byte-exact vs the offline DDS mip-0 for unclamped DXT.
+            // Fixes (a) leading-block false positives, (b) the old
+            // Pitch*Height over-read (4x for DXT → read past buffer).
+            size_t row_bytes = 0, rows = 0;
+            format_mip0((uint32_t)desc.Format, desc.Width, desc.Height,
+                        row_bytes, rows);
+            if (row_bytes > 0 && rows > 0 &&
+                row_bytes <= (size_t)lr.Pitch) {
+                std::vector<uint8_t> tight(row_bytes * rows);
+                const uint8_t* src = static_cast<const uint8_t*>(lr.pBits);
+                for (size_t r = 0; r < rows; ++r)
+                    std::memcpy(&tight[r * row_bytes],
+                                src + r * (size_t)lr.Pitch, row_bytes);
+                uint32_t crc = crc32(tight.data(), tight.size());
+                hash = ((uint64_t)crc << 32)
+                     | ((uint64_t)(desc.Width  & 0xFFFFu) << 16)
+                     |  (uint64_t)(desc.Height & 0xFFFFu);
+            }
             tex2d->UnlockRect(0);
         }
     }
@@ -970,6 +1160,7 @@ void on_destroy_resource(reshade::api::device*, reshade::api::resource resource)
     {
         std::lock_guard<std::mutex> g(g_resource_mu);
         g_resource_to_hash.erase(resource.handle);
+        g_resource_to_id.erase(resource.handle);
     }
     {
         std::lock_guard<std::mutex> g(g_resource_dims_mu);
@@ -1001,28 +1192,43 @@ inline void bind_normal_for_draw(reshade::api::command_list* cmd) {
         dev->GetTexture(0, &albedo);
         if (albedo) {
             uint64_t handle = (uint64_t)albedo;
-            uint64_t hash   = 0;
-            bool need_hash  = false;
-            {
-                std::lock_guard<std::mutex> g(g_resource_mu);
-                auto it = g_resource_to_hash.find(handle);
-                if (it != g_resource_to_hash.end()) hash = it->second;
-                else need_hash = true;
-            }
-            if (need_hash) {
-                hash = hash_d3d9_texture(albedo);
+            // idea #1: embedded-ID path takes precedence. Read FRESH every
+            // bind — never cache by resource pointer. The pointer-keyed
+            // cache is unsafe: destroy_resource erases by ReShade's
+            // resource.handle which is NOT (uint64_t)GetTexture-ptr, so a
+            // freed entry survives and a recycled allocation address gives
+            // a stale-id cache hit → wrong container, non-deterministically
+            // per zone reload (the reported bug). The read is 8 bytes from
+            // a POOL_MANAGED sysmem copy (no GPU sync) — cheap enough to
+            // do unconditionally; correctness over the broken micro-opt.
+            uint32_t id = read_embedded_id(albedo);
+
+            if (id) {
+                pbr = get_or_load_pbr_by_id(dev, id);
+            } else {
+                uint64_t hash   = 0;
+                bool need_hash  = false;
                 {
                     std::lock_guard<std::mutex> g(g_resource_mu);
-                    g_resource_to_hash[handle] = hash;
+                    auto it = g_resource_to_hash.find(handle);
+                    if (it != g_resource_to_hash.end()) hash = it->second;
+                    else need_hash = true;
                 }
-                if (hash) {
-                    if (lookup_normal_path(hash))
-                        g_index_hits.fetch_add(1, std::memory_order_relaxed);
-                    else
-                        g_index_misses.fetch_add(1, std::memory_order_relaxed);
+                if (need_hash) {
+                    hash = hash_d3d9_texture(albedo);
+                    {
+                        std::lock_guard<std::mutex> g(g_resource_mu);
+                        g_resource_to_hash[handle] = hash;
+                    }
+                    if (hash) {
+                        if (lookup_normal_path(hash))
+                            g_index_hits.fetch_add(1, std::memory_order_relaxed);
+                        else
+                            g_index_misses.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
+                if (hash) pbr = get_or_load_pbr(dev, hash);
             }
-            if (hash) pbr = get_or_load_pbr(dev, hash);
             albedo->Release();
         }
     }
@@ -1312,13 +1518,14 @@ void on_present(reshade::api::effect_runtime* rt) {
         char buf[400];
         std::snprintf(buf, sizeof(buf),
             "renodx-engine: frames=%llu replacements=%llu world-draws=%llu(per-tex %llu) "
-            "index-hits=%llu/misses=%llu lazy-loaded=%llu cache-size=%zu default-normal=%d",
+            "index-hits=%llu/misses=%llu id-tagged=%llu lazy-loaded=%llu cache-size=%zu default-normal=%d",
             (unsigned long long)f,
             (unsigned long long)g_replacements_done.load(),
             (unsigned long long)g_world_draws.load(),
             (unsigned long long)g_world_draws_per_tex_hit.load(),
             (unsigned long long)g_index_hits.load(),
             (unsigned long long)g_index_misses.load(),
+            (unsigned long long)g_id_hits.load(),
             (unsigned long long)g_lazy_loaded.load(),
             g_normal_cache.size(),
             g_default_normal ? 1 : 0);
@@ -1353,7 +1560,7 @@ BOOL WINAPI DllMain(HINSTANCE hmod, DWORD reason, LPVOID) {
             {
                 char b[200];
                 std::snprintf(b, sizeof(b),
-                    "renodx-engine: v0.9.7 registered — world.ps always; "
+                    "renodx-engine: v0.10.0 registered — world.ps always; "
                     "mesh.ps substitution=%s (NEOCRON_SUBSTITUTE_MESH)",
                     subst_extra() ? "ON" : "OFF");
                 reshade::log::message(reshade::log::level::info, b);
