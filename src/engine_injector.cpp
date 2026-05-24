@@ -218,7 +218,7 @@ const char* UNIFIED_PS_HLSL = R"hlsl(
 sampler2D samplerAlbedo   : register(s0);   // v0.8: our HD regen replaces the game's clamped-512 albedo here
 sampler2D samplerLightmap : register(s1);
 sampler2D samplerNormal   : register(s2);   // v0.5.5: back to s2 (was s5 — sparse may have broken DXVK)
-sampler2D samplerOrme     : register(s3);   // v0.8: R=occlusion G=roughness B=metallic A=emissive
+sampler2D samplerOrme     : register(s3);   // R=occlusion G=roughness B=metallic A=non-emis (inverted in v0.12: A=0 = full emissive)
 
 float4 colorCorrection : register(c4);  // GAME's per-draw constant
 
@@ -237,6 +237,12 @@ float4 main(float2 uv     : TEXCOORD0,
             float4 vcol_c : COLOR0) : COLOR { // world.vs uses this (oD0)
     // ps_2_0: no VPOS available, use fixed forward view in tangent space
     float4 albedo   = tex2D(samplerAlbedo,   uv);
+    // v0.12: pure-magenta keyed transparency (Doom-style binary alpha
+    // used by NC2 vanilla, esp. BMP w/o real alpha). Tolerance covers
+    // JPG q92 edge bleed. Pure scalar arithmetic for ps_2_b: key=1 when
+    // all 3 magenta conditions hold; clip(0.5-key) -> negative -> discard.
+    float mag_key = step(0.90, albedo.r) * step(albedo.g, 0.15) * step(0.90, albedo.b);
+    clip(0.5 - mag_key);
     float4 lightmap = tex2D(samplerLightmap, uv_lm);
 
     // The game's bytecode always reads from t2 — but on Wine/DXVK an
@@ -326,7 +332,12 @@ float4 main(float2 uv     : TEXCOORD0,
     float ao    = lerp(1.0, orme.r, has_orme);
     float rough = clamp(lerp(0.5, orme.g, has_orme), 0.045, 1.0);
     float metal = orme.b * has_orme;
-    float emis  = orme.a * has_orme;
+    // Emissive is INVERTED in alpha (v0.12): A=0 -> 100% emissive,
+    // A=1 -> non-emissive. Most surfaces are non-emissive, so storing
+    // them as A=1 keeps the PNG alpha visually opaque (instead of fully
+    // transparent the way A=0=non-emis did). has_orme=0 -> emis=0 (no
+    // false self-illum on textures without an ORME bound).
+    float emis  = (1.0 - orme.a) * has_orme;
 
     // ORME per-channel debug (15-19)
     if (dmode > 14.5 && dmode < 15.5) return float4(ao.xxx, 1.0);
@@ -1403,7 +1414,7 @@ void on_overlay(reshade::api::effect_runtime*) {
         "15 - ORME R: Occlusion",
         "16 - ORME G: Roughness",
         "17 - ORME B: Metallic",
-        "18 - ORME A: Emissive",
+        "18 - ORME A: Emissive (inverted: A=0 -> full emis)",
         "19 - ORME RGB (O,R,M)",
     };
     if (ImGui::Combo("Debug viz", &mode, MODES, IM_ARRAYSIZE(MODES))) g_debug_mode.store(mode);

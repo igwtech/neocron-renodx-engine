@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.12.0] — 2026-05-17
+
+**ORME alpha inverted: A=0 -> full emissive, A=1 -> non-emissive.** Most
+surfaces are non-emissive; storing them as A=1 keeps the PNG alpha
+visually opaque (it used to be A=0=non-emis, so most ORME PNGs were
+entirely transparent). The shader does `(1 - orme.a)` before use. The
+pipeline (`pack_orme`, `recover_orme`, `repatch_emissive`) writes the
+inverted convention; existing corpus migrated in place
+(`_invert_orme_alpha.py`).
+
+**Pure-magenta keyed transparency.** NC2 vanilla (notably BMPs without
+real alpha) uses pure magenta `(1,0,1)` as a Doom-style binary alpha
+key. The world.ps now `clip()`s any pixel whose sampled albedo matches
+magenta within JPG-q92 tolerance (`r>0.90 ∧ g<0.15 ∧ b>0.90`, scalar
+arithmetic for ps_2_b). Untagged textures using the vanilla benefit
+immediately; tagged textures get the same benefit once the pipeline
+re-imprints the vanilla's magenta key into the HD albedo
+(`preserve_magenta.py`).
+
 ## [0.11.0] — 2026-05-17
 
 **Embedded-ID texture identification + single-file PBR containers.**

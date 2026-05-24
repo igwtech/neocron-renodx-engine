@@ -1,7 +1,7 @@
 {
   "id": "neocron-renodx-engine",
   "name": "Neocron RenoDX Engine \u2014 HLSL pixel-shader injection",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "author": "Neocron Community",
   "description": "ReShade Add-on Edition .addon32 hooking D3D9 create_pipeline to substitute Neocron's world.ps (CRC 0x2ccf5eb7) with a runtime-compiled Cook-Torrance PBR shader. Each game texture is fingerprinted via D3D9 LockRect (64 KiB + dims) and looked up in the triplet index from the nc2-hd-textures addon. On hit it binds the creatively-regenerated HD albedo at s0 (bypassing the native 512px clamp), AI normals at s2 and ORME (R=occlusion G=roughness B=metallic A=emissive) at s3. v0.9: the baked lightmap is treated as incident irradiance feeding a real metallic-workflow GGX BRDF (D/G/F) + ambient IBL + ACES tonemap/exposure, instead of post-multiplying vanilla colour. Non-matched surfaces pass through vanilla. Tunables (Exposure, Ambient, PBR strength, bump, ORME debug viz) in the ReShade overlay \u2192 Add-ons tab.",
   "category": "graphics",
